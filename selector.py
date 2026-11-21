@@ -174,6 +174,8 @@ def class_setting_changes(old, new):
     def compare(a, b, owner=None):
         if type(a) is not type(b):
             return False
+        if isinstance(a, ast.ClassDef) and same_ast(a, b):
+            return True
         if isinstance(a, ast.ClassDef):
             owner = (owner + "." if owner else "") + a.name
         if isinstance(a, FUNCTIONS):
@@ -255,6 +257,8 @@ def value_change_scopes(old, new):
             return True
         if type(a) is not type(b):
             return False
+        if isinstance(a, (*FUNCTIONS, ast.ClassDef)) and same_ast(a, b):
+            return True
         if isinstance(a, ast.AST):
             if isinstance(a, FUNCTIONS) and any(
                 isinstance(node, (*FUNCTIONS, ast.Lambda, ast.ClassDef, ast.Global, ast.Nonlocal))
@@ -453,18 +457,24 @@ class Selector:
         )
         return initialization, impacted
 
-    def select(self, patch):
+    def select(self, patch, *, use_cold=True, _prepared=None):
         selected = set(self.unknown)
         reasons = []
         try:
-            edits = parse_patch(patch)
+            edits = parse_patch(patch) if _prepared is None else _prepared[0]
             if len({edit.path for edit in edits}) != len(edits):
                 return self.all, ["repeated file in patch"]
-            updates, touches, trees = {}, {}, {}
-            for edit in edits:
-                source = self.mapping["sources"].get(edit.path)
-                if edit.path.endswith(".py") and source is not None:
-                    updates[edit.path], touches[edit.path] = apply_edit(source, edit)
+            trees = {}
+            fallback_chosen = None
+            if _prepared is None:
+                updates, touches, parsed = {}, {}, {}
+                for edit in edits:
+                    source = self.mapping["sources"].get(edit.path)
+                    if edit.path.endswith(".py") and source is not None:
+                        updates[edit.path], touches[edit.path] = apply_edit(source, edit)
+                _prepared = edits, updates, touches, parsed
+            else:
+                _, updates, touches, parsed = _prepared
             import_ok = None
             for edit in edits:
                 path = edit.path
@@ -479,19 +489,19 @@ class Selector:
                 if source is None:
                     return self.all, ["unknown source: " + path]
                 updated, touched = updates[path], touches[path]
-                new_tree = ast.parse(updated)
-                old_tree, functions, assignments = self.analysis(path)
+                if path not in parsed:
+                    new_tree = ast.parse(updated)
+                    old_tree, functions, assignments = self.analysis(path)
+                    unchanged = same_ast(old_tree, new_tree)
+                    owners = set() if unchanged else class_setting_changes(old_tree, new_tree)
+                    parsed[path] = old_tree, new_tree, functions, assignments, unchanged, owners
+                old_tree, new_tree, functions, assignments, unchanged, owners = parsed[path]
                 trees[path] = old_tree, new_tree
-                if same_ast(old_tree, new_tree):
+                if re.search(r'coding\s*[:=]', ''.join(source.splitlines(True)[:2] + updated.splitlines(True)[:2])):
+                    return self.all, ['encoding directive: ' + path]
+                if unchanged:
                     # Preserve consumers of source text and code metadata. Syntax
                     # equality alone is not evidence that every test is unaffected.
-                    if re.search(
-                        r"coding\s*[:=]",
-                        "".join(
-                            source.splitlines(True)[:2] + updated.splitlines(True)[:2]
-                        ),
-                    ):
-                        return self.all, ["encoding directive: " + path]
                     selected.update(readers)
                     selected.update(
                         self.translated(self.mapping.get("introspection", []))
@@ -500,7 +510,41 @@ class Selector:
                         "unchanged AST with source-reader retention: " + path
                     )
                     continue
-                owners = class_setting_changes(old_tree, new_tree)
+                # Cold observations cover original fixtures and real workers.
+                # Keep explicit source readers and unknown contexts protected.
+                evidence = None
+                field_profile = self.mapping.get('field_consumers') if use_cold else None
+                if field_profile and owners:
+                    from fieldcheck import consumers
+                    mask = consumers(field_profile, path, source, updated, updates=updates)
+                    if mask is not None:
+                        evidence = field_profile, mask, 'dictionary keys and validator inputs'
+                compiled_profile = self.mapping.get('compiled_consumers') if use_cold else None
+                if evidence is None and compiled_profile:
+                    from compiledcheck import consumers
+                    mask = consumers(compiled_profile, path, source, updated)
+                    if mask is not None:
+                        evidence = compiled_profile, mask, 'cold executable scopes'
+                if evidence is not None:
+                    trace, mask, reason = evidence
+                    by_id = {test['id']: test['number'] for test in self.tests}
+                    # Each complete dependency pass supplies an independent
+                    # bound. Intersect them so conservative cold startup or
+                    # reflection observations cannot broaden existing evidence.
+                    if fallback_chosen is None:
+                        fallback_chosen, _ = self.select(patch, use_cold=False, _prepared=_prepared)
+                    incomplete = int(trace['incomplete'], 16)
+                    if incomplete:
+                        uncertain = {by_id[name] for i, name in enumerate(trace['tests'])
+                                     if incomplete & (1 << i) and name in by_id}
+                        selected.update(fallback_chosen & uncertain)
+                        mask &= ~incomplete
+                    selected.update(by_id[name] for i, name in enumerate(trace['tests'])
+                                    if mask & (1 << i) and name in by_id and by_id[name] in fallback_chosen)
+                    selected.update(readers & fallback_chosen)
+                    selected.update(self.translated(self.mapping.get('introspection', [])) & fallback_chosen)
+                    reasons.append(reason + ': ' + path)
+                    continue
                 if owners:
                     # Entry/size changes can affect iteration, membership, and
                     # derived initialization. Existing per-value evidence is
@@ -619,6 +663,11 @@ class Selector:
                     return self.all, ["missing coverage: " + path]
                 selected.update(impacted | readers)
                 reasons.append(("statement values: " if narrowed else "function: ") + path)
+            if fallback_chosen is not None:
+                # The independent selection already evaluated every comparison,
+                # value and behavior proof for this entire patch. Reuse that
+                # bound instead of repeating those expensive AST traversals.
+                return selected & fallback_chosen, reasons
             if len(updates) == len(edits) and self.mapping.get("comparison_types"):
                 from comparisoncheck import certified_tests
 
@@ -713,6 +762,8 @@ def main():
     parser.add_argument("--no-query-replay", action="store_true")
     parser.add_argument("--behavior", type=Path, default=Path(__file__).parent / "maps/behavior.json.gz")
     parser.add_argument("--timing", type=Path, default=Path(__file__).parent / "maps/timing.json.gz")
+    parser.add_argument('--compiled', type=Path, default=Path(__file__).parent / 'maps/compiled.json.gz')
+    parser.add_argument('--fields', type=Path, default=Path(__file__).parent / 'maps/fields.json.gz')
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -723,6 +774,14 @@ def main():
     with gzip.open(args.map, "rt") as f:
         mapping = json.load(f)
     merge_profile(mapping, profile, load_setting_flow(args.setting_flow))
+    from compiledcheck import load_profile as load_compiled
+    from fieldcheck import load_profile as load_fields
+    compiled = load_compiled(args.compiled)
+    fields = load_fields(args.fields)
+    if compiled:
+        mapping['compiled_consumers'] = compiled
+    if fields:
+        mapping['field_consumers'] = fields
     from comparisoncheck import load_comparison_profile
     comparison_profile = load_comparison_profile(args.comparisons)
     if comparison_profile:
@@ -740,7 +799,8 @@ def main():
                                                queries=args.queries if args.query_checks else None,
                                                values=values, behavior=behavior,
                                                timing=load_timing(args.timing),
-                                               task_queries=None if args.no_query_replay else args.task_queries)
+                                               task_queries=None if args.no_query_replay else args.task_queries,
+                                               compiled=compiled)
     try:
         for path in sorted((args.data / "commits").glob("*.patch")):
             patch = path.read_text()

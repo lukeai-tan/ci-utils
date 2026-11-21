@@ -28,11 +28,15 @@ def source_hash(source):
 
 def comparison_changes(old, new, path):
     """Accept only operator substitutions with unchanged operands and bindings."""
+    from selector import same_ast
+
     changes = set()
 
     def compare(a, b, in_function=False):
         if type(a) is not type(b):
             return False
+        if isinstance(a, (*FUNCTIONS, ast.ClassDef)) and same_ast(a, b):
+            return True
         if isinstance(a, ast.Compare):
             if len(a.ops) == len(b.ops) == 1 and type(a.ops[0]) is not type(b.ops[0]):
                 if (not in_function or not any({type(a.ops[0]), type(b.ops[0])} <= family

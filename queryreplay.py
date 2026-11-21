@@ -8,6 +8,7 @@ import decimal
 import gzip
 import hashlib
 import json
+import lzma
 import os
 import pickle
 import sys
@@ -21,6 +22,62 @@ from valuecheck import unchanged, validated_change
 
 
 TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+
+
+def checkpoint_digest(value):
+    """Snapshot observable state explicitly; Expr.__reduce__ omits caches/links."""
+    import enum
+    seen = {}
+    missing = object()
+
+    def encode(item):
+        if item is missing:
+            return ['uninitialized-slot']
+        cls = type(item)
+        if item is None or cls in (str, int, bool):
+            return [cls.__name__, item]
+        if cls is float:
+            return ['float', item.hex()]
+        if cls is bytes:
+            return ['bytes', item.hex()]
+        if isinstance(item, enum.Enum) and cls.__module__.startswith('sqlglot.'):
+            return ['enum', cls.__module__, cls.__qualname__, object.__getattribute__(item, '_name_')]
+        if id(item) in seen:
+            return ['ref', seen[id(item)]]
+        index = seen[id(item)] = len(seen)
+        if cls is dict:
+            return [index, 'dict', [[encode(k), encode(v)] for k, v in item.items()]]
+        if cls in (tuple, list):
+            return [index, cls.__name__, [encode(v) for v in item]]
+        if cls in (set, frozenset):
+            if any(type(v) not in (str, int, bool, type(None)) for v in item):
+                raise ValueError('unsupported checkpoint set')
+            return [index, cls.__name__, [encode(v) for v in sorted(item, key=lambda v: (type(v).__name__, repr(v)))]]
+        if cls.__module__.startswith(('sqlglot.expressions.', 'sqlglot.schema', 'sqlglot.dialects.')):
+            fields = {}
+            for base in type.__getattribute__(cls, '__mro__'):
+                slots = type.__getattribute__(base, '__dict__').get('__slots__', ())
+                slots = (slots,) if type(slots) is str else slots
+                for name in slots:
+                    if name not in {'__dict__', '__weakref__'}:
+                        try:
+                            fields[name] = object.__getattribute__(item, name)
+                        except AttributeError:
+                            fields[name] = missing
+            namespace = None
+            try:
+                namespace = object.__getattribute__(item, '__dict__')
+                if type(namespace) is not dict:
+                    raise ValueError('unsupported checkpoint namespace')
+            except AttributeError:
+                pass
+            if not fields and namespace is None and not cls.__module__.startswith('sqlglot.dialects.'):
+                raise ValueError('unknown checkpoint object')
+            return [index, cls.__module__, cls.__qualname__,
+                    [[k, encode(v)] for k, v in sorted(fields.items())], encode(namespace)]
+        raise ValueError('unsupported checkpoint value: ' + cls.__name__)
+
+    return hashlib.sha256(json.dumps(encode(value), separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
 
 
 def result_digest(table):
@@ -80,11 +137,20 @@ def compact_states(data):
 def state_bytes(data, key, *, decode=None):
     if data["version"] == 1:
         return data["states"][key]
-    result = b"".join(decode(part) if decode is not None else zlib.decompress(data["chunks"][part])
+    result = b"".join(decode(part) if decode is not None else decode_chunk(data, part)
                       for part in data["states"][key])
     if hashlib.sha256(result).hexdigest() != key:
         raise ValueError("worker state checksum mismatch")
     return result
+
+
+def decode_chunk(data, key):
+    codec = data.get('codec', 'zlib')
+    if codec == 'zlib':
+        return zlib.decompress(data['chunks'][key])
+    if codec == 'xz':
+        return lzma.decompress(data['chunks'][key])
+    raise ValueError('unknown worker-state compression')
 
 
 def load_profile(path):
@@ -170,7 +236,7 @@ def plan(base, patch, values, tasks, behavior=None):
     return indices, sum(tasks["queries"][i]["cpu"] for i in indices)
 
 
-def replay(root, data, indices):
+def replay(root, data, indices, *, checkpoints=None):
     """Execute the actual patched mp_execute function, including its whole backend.
 
     Each task receives the precise schema/table state that its real baseline
@@ -183,6 +249,15 @@ def replay(root, data, indices):
     os.chdir(root)
     sys.path.insert(0, str(root))
     from tests import test_executor as driver
+    executor = None
+    if checkpoints:
+        import sqlglot.executor as executor
+
+    class CheckpointMatched(BaseException):
+        pass
+
+    original_optimize = executor.optimize if executor is not None else None
+    matched = 0
 
     chunks = OrderedDict()
     cache_bytes = 0
@@ -191,7 +266,7 @@ def replay(root, data, indices):
         if key in chunks:
             chunks.move_to_end(key)
             return chunks[key]
-        raw = zlib.decompress(data["chunks"][key])
+        raw = decode_chunk(data, key)
         if len(raw) <= 32 * 1024**2:
             while chunks and cache_bytes + len(raw) > 32 * 1024**2:
                 _, expired = chunks.popitem(last=False)
@@ -211,8 +286,29 @@ def replay(root, data, indices):
         function, args, kwargs = pickle.loads(query["task"])
         if function is not driver.mp_execute or kwargs or len(args) != 2:
             raise ValueError("unrecognized executor task")
+        expected = (checkpoints or {}).get(str(index))
+        if expected and expected[0].get('kind') == 'expression_graph_v1':
+            before = state_digest((driver._schema, driver._tables))
+            def optimize(*a, **kw):
+                expression = original_optimize(*a, **kw)
+                if (checkpoint_digest((expression, a, kw)) == expected[0]['output']
+                        and state_digest((driver._schema, driver._tables)) == before):
+                    raise CheckpointMatched()
+                return expression
+            executor.optimize = optimize
+            try:
+                function(*args, **kwargs)
+            except CheckpointMatched:
+                matched += 1
+                continue
+            finally:
+                executor.optimize = original_optimize
+            # A changed checkpoint can still lead to an identical full result.
+            # Restore every input before checking the complete task again.
+            driver.initializer(*pickle.loads(snapshot(query['state'])))
+            function, args, kwargs = pickle.loads(query['task'])
         result = pickle.loads(pickle.dumps(function(*args, **kwargs), protocol=5))
         if (result_digest(result) != query["result"]
                 or state_digest((driver._schema, driver._tables)) != query["after"]):
             raise ValueError("executor task output or shared state changed")
-    return {"passed": [TEST], "replayed_queries": len(indices)}
+    return {"passed": [TEST], "replayed_queries": len(indices), 'matched_checkpoints': matched}

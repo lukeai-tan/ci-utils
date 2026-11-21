@@ -311,7 +311,7 @@ def supported_patch(base, patch, backend_files=()):
                             if isinstance(target, ast.Attribute) and target.attr.isupper():
                                 return False
                             target = target.value
-                        return not isinstance(target, ast.Name) or target.id in local_names and target.id != "cls"
+                        return isinstance(target, ast.Name) and target.id in local_names and target.id != "cls"
 
                     for node in ast.walk(tree):
                         if isinstance(node, (ast.Global, ast.Nonlocal, ast.Import, ast.ImportFrom)):

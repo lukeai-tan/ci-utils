@@ -57,11 +57,15 @@ def comparison_site(node):
 
 def comparison_change(old, new, path):
     """Require exactly one comparison edit in an otherwise identical function body."""
+    from selector import same_ast
+
     changes = []
 
     def visit(a, b, body=False):
         if type(a) is not type(b):
             return False
+        if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and same_ast(a, b):
+            return True
         if isinstance(a, ast.Compare) and body:
             before, after = comparison_site(a), comparison_site(b)
             if before and after and before["side"] == after["side"] and before["type"] == after["type"]:

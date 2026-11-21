@@ -234,7 +234,7 @@ def serve(base, queries=None, task_queries=None):
                             from queryreplay import replay
                             signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError("task replay CPU budget")))
                             signal.setitimer(signal.ITIMER_PROF, request["cpu_limit"])
-                            result = replay(tree.root, task_baseline, request["indices"])
+                            result = replay(tree.root, task_baseline, request["indices"], checkpoints=request.get('checkpoints'))
                         elif request.get("kind") == "queries" and query_baseline is not None:
                             from querycheck import run_boundaries
                             signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError("query CPU budget")))
@@ -247,8 +247,11 @@ def serve(base, queries=None, task_queries=None):
                         payload = json.dumps(result).encode()
                         with os.fdopen(write_fd, "wb") as output:
                             output.write(payload)
-                    except BaseException:
-                        pass
+                    except BaseException as error:
+                        try:
+                            os.write(write_fd, json.dumps({'passed': [], 'error': type(error).__name__}).encode())
+                        except OSError:
+                            pass
                     finally:
                         os._exit(0)
                 os.close(write_fd)
@@ -278,7 +281,7 @@ def serve(base, queries=None, task_queries=None):
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -295,6 +298,7 @@ class Verifier:
         self.queries = Path(queries) if queries is not None else None
         self.query_backend_files = None
         self.values = values
+        self.compiled = compiled
         self.behavior = behavior
         self.task_queries = Path(task_queries) if task_queries is not None else None
         self.task_baseline = None
@@ -362,8 +366,7 @@ class Verifier:
         if saving < 8:
             return selected, []
         try:
-            # Most patches cannot use task replay. Avoid decoding the serialized
-            # table states unless a supported literal comparison actually changed.
+            # Avoid decoding table states for files outside optimizer replay.
             edits = parse_patch(patch)
             if len(edits) != 1 or not edits[0].path.startswith("sqlglot/optimizer/"):
                 return selected, []
@@ -373,12 +376,31 @@ class Verifier:
             if change is None and self.behavior is not None:
                 from behaviorcheck import validated_change as behavior_change
                 change = behavior_change(self.behavior, {edits[0].path: updated}, {edits[0].path: old})
-            if change is None:
+            if change is None and self.compiled is None:
                 return selected, []
+            if change is None and self.compiled is not None:
+                from compiledcheck import query_reachability
+                if query_reachability(self.compiled, self.base, patch) is None:
+                    return selected, []
             if self.task_baseline is None:
                 self.task_baseline = load_profile(self.task_queries)
                 self.close()  # A previously started worker did not load task data.
-            request_plan = plan(self.base, patch, self.values, self.task_baseline, self.behavior)
+            request_plan = plan(self.base, patch, self.values, self.task_baseline, self.behavior) if change else None
+            checkpoints = {}
+            if self.compiled is not None:
+                from compiledcheck import query_plan
+                compiled_plan = query_plan(self.compiled, self.base, patch, self.task_baseline)
+                if compiled_plan is not None:
+                    reachable, estimate, available = compiled_plan
+                    if request_plan is None:
+                        checkpoints = available
+                        request_plan = reachable, estimate
+                    elif set(request_plan[0]) <= set(reachable):
+                        indices = request_plan[0]
+                        checkpoints = {str(i): available[str(i)] for i in indices if str(i) in available}
+                        estimate = sum(checkpoints[str(i)][0].get('cpu', self.task_baseline['queries'][i]['cpu'])
+                                       if str(i) in checkpoints else self.task_baseline['queries'][i]['cpu'] for i in indices)
+                        request_plan = indices, estimate
             if request_plan is None:
                 return selected, []
             indices, estimate = request_plan
@@ -393,7 +415,7 @@ class Verifier:
             budget = min(budget, self.cpu_budget - self.used_cpu)
             if budget <= 0:
                 return selected, []
-            request = {"kind": "task_queries", "patch": patch, "tests": [TEST], "indices": indices,
+            request = {"kind": "task_queries", "patch": patch, "tests": [TEST], "indices": indices, 'checkpoints': checkpoints,
                        "cpu_limit": budget, "wall_limit": min(12, max(0.1, self.deadline - time.monotonic()))}
             self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
@@ -443,8 +465,10 @@ class Verifier:
                 or time.monotonic() >= self.deadline or self.used_cpu >= self.cpu_budget):
             return selected, []
         prices = self.timing["cpu"] if self.timing else self.profile.get("cpu", {})
-        candidates = {n for n in selected if self.tests[n]["seconds"] < 3
-                      and self.tests[n]["id"] in prices}
+        # Simulated duration does not predict verification CPU. Use measured
+        # real method and fixture costs, and retain anything not completed.
+        candidates = {n for n in selected if self.tests[n]["id"] in prices
+                      and prices[self.tests[n]["id"]] <= 4.0}
         if self.timing:
             # A large bundle's whole saving requires many tests to pass. Price
             # smaller critical bundles as well; unrun tests are always retained.
