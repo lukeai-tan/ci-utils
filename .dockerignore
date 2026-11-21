@@ -3,11 +3,15 @@
 !runtime.py
 !querycheck.py
 !comparisoncheck.py
+!valuecheck.py
+!queryreplay.py
 !maps/
 !maps/baseline.json.gz
 !maps/runtime.json.gz
 !maps/settings.json.gz
 !maps/comparisons.json.gz
+!maps/values.json.gz
+!maps/query-values.pkl.gz
 !maps/queries.pkl.gz
 !requirements.lock
 !LICENSE
