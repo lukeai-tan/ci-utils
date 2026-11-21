@@ -1,0 +1,8 @@
+*
+!selector.py
+!maps/
+!maps/baseline.json.gz
+!requirements.lock
+!LICENSE
+!tools/
+!tools/SQLGLOT_LICENSE

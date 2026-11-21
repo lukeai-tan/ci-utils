@@ -1,0 +1,19 @@
+__pycache__/
+.pytest_cache/
+.coverage*
+output*.jsonl
+*.log
+.ruff_cache/
+
+/README.md
+
+# Local development and evaluation assets
+/Makefile
+/SCORING.md
+/requirements.lock
+/sample/
+/score.py
+/tests/
+/maps/manifest.json
+/tools/*
+!/tools/SQLGLOT_LICENSE
