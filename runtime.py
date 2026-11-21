@@ -180,7 +180,7 @@ def cpu_seconds():
     return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
 
 
-def serve(base, queries=None):
+def serve(base, queries=None, task_queries=None):
     os.environ.update(PYTHONDONTWRITEBYTECODE="1", OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1",
                       NUMEXPR_MAX_THREADS="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     import pytest  # Warm third-party imports only; patched packages load in children.
@@ -189,6 +189,10 @@ def serve(base, queries=None):
     if queries is not None and queries.is_file():
         from querycheck import load_baseline
         query_baseline = load_baseline(queries)
+    task_baseline = None
+    if task_queries is not None and task_queries.is_file():
+        from queryreplay import load_profile
+        task_baseline = load_profile(task_queries)
 
     print(json.dumps({"ready": True, "cpu": cpu_seconds()}), flush=True)
     for line in sys.stdin:
@@ -208,7 +212,12 @@ def serve(base, queries=None):
                         with open(os.devnull, "w") as sink:
                             os.dup2(sink.fileno(), 1)
                             os.dup2(sink.fileno(), 2)
-                        if request.get("kind") == "queries" and query_baseline is not None:
+                        if request.get("kind") == "task_queries" and task_baseline is not None:
+                            from queryreplay import replay
+                            signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError("task replay CPU budget")))
+                            signal.setitimer(signal.ITIMER_PROF, request["cpu_limit"])
+                            result = replay(tree.root, task_baseline, request["indices"])
+                        elif request.get("kind") == "queries" and query_baseline is not None:
                             from querycheck import run_boundaries
                             signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError("query CPU budget")))
                             signal.setitimer(signal.ITIMER_PROF, request["cpu_limit"])
@@ -251,7 +260,7 @@ def serve(base, queries=None):
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, task_queries=None, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.tests = {test["number"]: test for test in tests}
@@ -263,8 +272,13 @@ class Verifier:
         self.deadline = time.monotonic() + wall_budget
         self.disabled = not self.base.is_dir()
         self.unprofitable = 0
+        self.task_unprofitable = 0
         self.queries = Path(queries) if queries is not None else None
         self.query_backend_files = None
+        self.values = values
+        self.task_queries = Path(task_queries) if task_queries is not None else None
+        self.task_baseline = None
+        self.task_available = bool(values and self.task_queries is not None and self.task_queries.is_file())
         if self.queries is not None and self.queries.is_file():
             from querycheck import load_baseline
             try:
@@ -304,6 +318,8 @@ class Verifier:
             command = [sys.executable, "-B", str(Path(__file__).resolve()), "--serve", "--source", str(self.base.resolve())]
             if self.queries is not None:
                 command.extend(["--queries", str(self.queries.resolve())])
+            if self.task_baseline is not None:
+                command.extend(["--task-queries", str(self.task_queries.resolve())])
             self.process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -312,6 +328,62 @@ class Verifier:
                      "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "NUMEXPR_MAX_THREADS": "1"},
             )
             self.used_cpu += self.read(10)["cpu"]
+
+    def task_query_refine(self, patch, selected, *, protected=()):
+        from queryreplay import TEST, load_profile, plan
+        from selector import apply_edit, parse_patch
+        from valuecheck import validated_change
+
+        number = self.by_id.get(TEST)
+        if (self.disabled or self.task_unprofitable >= 2 or not self.task_available or number not in selected or number in protected
+                or self.used_cpu >= self.cpu_budget or time.monotonic() >= self.deadline):
+            return selected, []
+        saving = self.cost(selected) - self.cost(selected - {number})
+        if saving < 8:
+            return selected, []
+        try:
+            # Most patches cannot use task replay. Avoid decoding the serialized
+            # table states unless a supported literal comparison actually changed.
+            edits = parse_patch(patch)
+            if len(edits) != 1 or not edits[0].path.startswith("sqlglot/optimizer/"):
+                return selected, []
+            old = (self.base / edits[0].path).read_text()
+            updated, _ = apply_edit(old, edits[0])
+            if validated_change(self.values, {edits[0].path: updated}, {edits[0].path: old}) is None:
+                return selected, []
+            if self.task_baseline is None:
+                self.task_baseline = load_profile(self.task_queries)
+                self.close()  # A previously started worker did not load task data.
+            request_plan = plan(self.base, patch, self.values, self.task_baseline)
+            if request_plan is None:
+                return selected, []
+            indices, estimate = request_plan
+            # Charge startup, checkout and state restoration as well as baseline
+            # query work. A timeout or partial task never removes the test.
+            budget = min(6.0, saving * 0.3, self.cpu_budget - self.used_cpu)
+            if 1.0 + estimate * 1.5 > budget:
+                return selected, []
+            if not indices:
+                return selected - {number}, ["complete baseline task comparisons unchanged"]
+            self.start()
+            budget = min(budget, self.cpu_budget - self.used_cpu)
+            if budget <= 0:
+                return selected, []
+            request = {"kind": "task_queries", "patch": patch, "tests": [TEST], "indices": indices,
+                       "cpu_limit": budget, "wall_limit": min(12, max(0.1, self.deadline - time.monotonic()))}
+            self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+            self.process.stdin.flush()
+            result = self.read(min(14, max(0.1, self.deadline - time.monotonic())))
+            self.used_cpu += result["cpu"]
+            if result.get("passed") == [TEST] and result.get("replayed_queries") == len(indices):
+                self.task_unprofitable = self.task_unprofitable + 1 if result["cpu"] >= saving else 0
+                return selected - {number}, [f"verified {len(indices)} affected TPC-DS queries and shared input state"]
+            self.task_unprofitable += 1
+            return selected, ["affected query replay incomplete or changed; retained executor"]
+        except (OSError, ValueError, KeyError, TypeError, EOFError, TimeoutError, RecursionError):
+            self.close()
+            self.task_unprofitable += 1
+            return selected, ["task replay unavailable; retained executor"]
 
     def query_refine(self, patch, selected):
         from querycheck import METHODS, supported_patch
@@ -376,6 +448,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--queries", type=Path)
+    parser.add_argument("--task-queries", type=Path)
     args = parser.parse_args()
     if args.serve:
-        serve(args.source, args.queries)
+        serve(args.source, args.queries, args.task_queries)

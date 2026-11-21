@@ -619,6 +619,18 @@ class Selector:
                 if removable:
                     selected.difference_update(removable)
                     reasons.append(f"baseline operand types certify {len(removable)} comparison consumers")
+            if len(updates) == len(edits) and self.mapping.get("literal_values"):
+                from valuecheck import certified_tests
+
+                proven = certified_tests(self.mapping["literal_values"], updates,
+                                         self.mapping["sources"], self.tests, trees=trees)
+                retained = set(self.unknown) | self.translated(self.mapping.get("introspection", []))
+                for edit in edits:
+                    retained.update(self.translated(self.mapping["reads"].get(edit.path, [])))
+                removable = selected & (proven - retained)
+                if removable:
+                    selected.difference_update(removable)
+                    reasons.append(f"baseline primitive values certify {len(removable)} comparison consumers")
         except (ValueError, SyntaxError, KeyError, TypeError, RecursionError) as exc:
             return self.all, ["fallback: " + str(exc)]
         return selected, reasons
@@ -672,6 +684,9 @@ def main():
     parser.add_argument("--static", action="store_true")
     parser.add_argument("--queries", type=Path, default=Path(__file__).parent / "maps/queries.pkl.gz")
     parser.add_argument("--query-checks", action="store_true")
+    parser.add_argument("--values", type=Path, default=Path(__file__).parent / "maps/values.json.gz")
+    parser.add_argument("--task-queries", type=Path, default=Path(__file__).parent / "maps/query-values.pkl.gz")
+    parser.add_argument("--no-query-replay", action="store_true")
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -686,14 +701,27 @@ def main():
     comparison_profile = load_comparison_profile(args.comparisons)
     if comparison_profile:
         mapping["comparison_types"] = comparison_profile
+    from valuecheck import LazyProfile
+    values = LazyProfile(args.values) if args.values.is_file() else None
+    if values:
+        mapping["literal_values"] = values
     selector = Selector(mapping, tests)
     verifier = None if args.static else Verifier(args.source, profile, tests, selector.schedule,
-                                               queries=args.queries if args.query_checks else None)
+                                               queries=args.queries if args.query_checks else None,
+                                               values=values, task_queries=None if args.no_query_replay else args.task_queries)
     try:
         for path in sorted((args.data / "commits").glob("*.patch")):
             patch = path.read_text()
             chosen, reasons = selector.select(patch)
             if verifier is not None:
+                protected = set(selector.unknown) | selector.translated(mapping.get("introspection", []))
+                try:
+                    for edit in parse_patch(patch):
+                        protected.update(selector.translated(mapping["reads"].get(edit.path, [])))
+                except ValueError:
+                    protected.update(selector.all)
+                chosen, checked = verifier.task_query_refine(patch, chosen, protected=protected)
+                reasons.extend(checked)
                 chosen, checked = verifier.query_refine(patch, chosen)
                 reasons.extend(checked)
                 chosen, checked = verifier.refine(patch, chosen)
