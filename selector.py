@@ -587,6 +587,18 @@ class Selector:
                     return self.all, ["missing coverage: " + path]
                 selected.update(impacted | readers)
                 reasons.append(("statement values: " if narrowed else "function: ") + path)
+            if len(updates) == len(edits) and self.mapping.get("comparison_types"):
+                from comparisoncheck import certified_tests
+
+                proven = certified_tests(self.mapping["comparison_types"], updates,
+                                         self.mapping["sources"], self.tests)
+                retained = set(self.unknown) | self.translated(self.mapping.get("introspection", []))
+                for edit in edits:
+                    retained.update(self.translated(self.mapping["reads"].get(edit.path, [])))
+                removable = selected & (proven - retained)
+                if removable:
+                    selected.difference_update(removable)
+                    reasons.append(f"baseline operand types certify {len(removable)} comparison consumers")
         except (ValueError, SyntaxError, KeyError, TypeError, RecursionError) as exc:
             return self.all, ["fallback: " + str(exc)]
         return selected, reasons
@@ -635,6 +647,7 @@ def main():
     parser.add_argument("--no-fill", action="store_true")
     parser.add_argument("--profile", type=Path, default=Path(__file__).parent / "maps/runtime.json.gz")
     parser.add_argument("--setting-flow", type=Path, default=Path(__file__).parent / "maps/settings.json.gz")
+    parser.add_argument("--comparisons", type=Path, default=Path(__file__).parent / "maps/comparisons.json.gz")
     parser.add_argument("--source", type=Path, default=Path("/app/source"))
     parser.add_argument("--static", action="store_true")
     parser.add_argument("--queries", type=Path, default=Path(__file__).parent / "maps/queries.pkl.gz")
@@ -649,6 +662,10 @@ def main():
     with gzip.open(args.map, "rt") as f:
         mapping = json.load(f)
     merge_profile(mapping, profile, load_setting_flow(args.setting_flow))
+    from comparisoncheck import load_comparison_profile
+    comparison_profile = load_comparison_profile(args.comparisons)
+    if comparison_profile:
+        mapping["comparison_types"] = comparison_profile
     selector = Selector(mapping, tests)
     verifier = None if args.static else Verifier(args.source, profile, tests, selector.schedule,
                                                queries=args.queries if args.query_checks else None)
