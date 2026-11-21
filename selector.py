@@ -210,6 +210,19 @@ def class_setting_changes(old, new):
     return owners if compare(old, new) else set()
 
 
+def literal_setting_value(node):
+    """Literal construction cannot introduce initializer call side effects."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(literal_setting_value(item) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(key is not None and literal_setting_value(key) and literal_setting_value(value)
+                   for key, value in zip(node.keys, node.values))
+    return (isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub))
+            and isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float, complex))
+
+
 def value_change_scopes(old, new):
     """Find statements affected by literal/operator edits inside function bodies.
 
@@ -435,11 +448,14 @@ class Selector:
                         selected.update(
                             self.translated(self.mapping.get("introspection", []))
                         )
+                        setting_keys = set()
+                        literal_settings = True
                         for node in assignments:
                             if any(
                                 node.lineno <= line <= node.end_lineno
                                 for line in touched
                             ):
+                                literal_settings = literal_settings and literal_setting_value(node.value)
                                 targets = (
                                     node.targets
                                     if isinstance(node, ast.Assign)
@@ -447,15 +463,26 @@ class Selector:
                                 )
                                 for target in targets:
                                     if isinstance(target, ast.Name):
+                                        setting_keys.update(key + ":" + target.id for key in keys)
                                         qualified = self.mapping.get("qualified_attributes")
                                         if qualified is None:
                                             consumers = self.mapping.get("attributes", {}).get(target.id, [])
                                         else:
                                             consumers = {i for key in keys for i in qualified.get(key + ":" + target.id, [])}
                                         selected.update(self.translated(consumers))
-                        for key in keys:
-                            selected.update(self.translated(class_map[key]))
-                        reasons.append("observed class consumers: " + path)
+                        precise = (
+                            self.mapping.get("attribute_complete", False)
+                            and literal_settings
+                            and all(key in self.mapping.get("setting_precise_classes", []) for key in keys)
+                            and bool(setting_keys)
+                            and all(not key.rsplit(":", 1)[-1].startswith("__") for key in setting_keys)
+                            and all(key in self.mapping.get("qualified_attributes", {}) for key in setting_keys)
+                            and not setting_keys.intersection(self.mapping.get("setting_collection", []))
+                        )
+                        if not precise:
+                            for key in keys:
+                                selected.update(self.translated(class_map[key]))
+                        reasons.append(("observed setting reads: " if precise else "observed class consumers: ") + path)
                         continue
                 if not same_ast(old_tree, new_tree, structure=True):
                     return self.all, ["module/class structure: " + path]

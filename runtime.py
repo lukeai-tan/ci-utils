@@ -24,7 +24,7 @@ def load_profile(path):
     try:
         with gzip.open(path, "rt") as source:
             profile = json.load(source)
-        if profile["revision"] != REVISION or profile["version"] != 1:
+        if profile["revision"] != REVISION or profile["version"] not in (1, 2):
             return None
         return profile
     except (OSError, ValueError, KeyError, TypeError):
@@ -35,6 +35,9 @@ def merge_profile(mapping, profile):
     """Add class evidence and distinguish explicit source reads from imports."""
     if not profile or profile.get("incomplete"):
         return
+    mapping["attribute_complete"] = profile.get("attribute_complete", False)
+    mapping["setting_collection"] = profile.get("collection", [])
+    mapping["setting_precise_classes"] = profile.get("setting_precise_classes", [])
     by_id = {name: index for index, name in enumerate(mapping["tests"])}
     numbers = {i: by_id[name] for i, name in enumerate(profile["tests"]) if name in by_id}
     reads = mapping.setdefault("reads", {})
@@ -51,6 +54,22 @@ def merge_profile(mapping, profile):
         mapping.setdefault("qualified_attributes", {})[key] = sorted(
             set(mapping.get("qualified_attributes", {}).get(key, [])) | {numbers[i] for i in consumers if i in numbers}
         )
+    # A passing parent is insufficient evidence for code executed in a child.
+    # Only explicit, successful child traces can resolve baseline uncertainty.
+    complete = {i for i in profile.get("child_complete", [])
+                if i in numbers and i not in profile.get("child_failed", [])
+                and profile["tests"][i] in profile.get("cpu", {})}
+    for path, entries in profile.get("child_lines", {}).items():
+        lines = mapping.setdefault("lines", {}).setdefault(path, {})
+        consumers = set()
+        for line, observed in entries.items():
+            traced = {numbers[i] for i in observed if i in complete}
+            lines[line] = sorted(set(lines.get(line, [])) | traced)
+            consumers.update(traced)
+        mapping.setdefault("files", {})[path] = sorted(set(mapping.get("files", {}).get(path, [])) | consumers)
+    resolved = {numbers[i] for i in complete}
+    failed = {numbers[i] for i in profile.get("child_failed", []) if i in numbers}
+    mapping["incomplete"] = sorted((set(mapping.get("incomplete", [])) - resolved) | failed)
 
 
 class PatchedTree:
