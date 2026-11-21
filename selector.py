@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 import argparse
+import os
+import subprocess
+import tempfile
 import ast
 import gzip
 import json
 import re
+import resource
 import sys
 import time
 from dataclasses import dataclass, field
@@ -130,9 +134,113 @@ class Structure(ast.NodeTransformer):
     visit_AsyncFunctionDef = visit_FunctionDef
 
 
+def literal_shape(value):
+    if isinstance(value, dict):
+        return (dict, tuple((repr(k), literal_shape(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return (type(value), tuple(literal_shape(v) for v in value))
+    if isinstance(value, (set, frozenset)):
+        return (type(value), len(value))
+    return type(value)
+
+
+def class_setting_changes(old, new):
+    """Accept same-shaped literal settings; leave factory/import edits unresolved."""
+    owners = set()
+
+    def compare(a, b, owner=None):
+        if ast.dump(a) == ast.dump(b):
+            return True
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.ClassDef):
+            owner = (owner + "." if owner else "") + a.name
+        if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        if owner and isinstance(a, (ast.Assign, ast.AnnAssign)):
+            try:
+                av, bv = ast.literal_eval(a.value), ast.literal_eval(b.value)
+            except (ValueError, TypeError, SyntaxError):
+                return False
+            if literal_shape(av) != literal_shape(bv):
+                return False
+            a.value = b.value = ast.Constant(None)
+            if ast.dump(a) != ast.dump(b):
+                return False
+            owners.add(owner)
+            return True
+        for field_name, av in ast.iter_fields(a):
+            bv = getattr(b, field_name)
+            if isinstance(av, ast.AST):
+                if not compare(av, bv, owner):
+                    return False
+            elif isinstance(av, list):
+                if len(av) != len(bv):
+                    return False
+                for x, y in zip(av, bv):
+                    if isinstance(x, ast.AST):
+                        if not isinstance(y, ast.AST) or not compare(x, y, owner):
+                            return False
+                    elif x != y:
+                        return False
+            elif av != bv:
+                return False
+        return True
+
+    return owners if compare(old, new) else set()
+
+
+class ImportCheck:
+    """Use a fresh interpreter to check changed class initialization."""
+
+    def __init__(self, sources):
+        self.sources = sources
+        self.directory = None
+        self.remaining_seconds = 12.0
+
+    def check(self, path, source):
+        if self.remaining_seconds <= 0:
+            return False
+        started = time.monotonic()
+        if self.directory is None:
+            self.directory = tempfile.TemporaryDirectory(prefix="ci-import-")
+            for name, text in self.sources.items():
+                if name.startswith("sqlglot/"):
+                    target = Path(self.directory.name) / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(text)
+        target = Path(self.directory.name) / path
+        module = path.removesuffix(".py").replace("/", ".")
+        try:
+            target.write_text(source)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    "import sys,importlib;sys.path.insert(0,sys.argv[1]);importlib.import_module(sys.argv[2])",
+                    self.directory.name,
+                    module,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                timeout=min(2.0, self.remaining_seconds),
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        finally:
+            self.remaining_seconds -= time.monotonic() - started
+            target.write_text(self.sources[path])
+
+
 class Selector:
-    def __init__(self, mapping, tests):
+    def __init__(self, mapping, tests, import_check=None):
         self.mapping = mapping
+        self.import_check = (
+            import_check or ImportCheck(mapping.get("sources", {})).check
+        )
         self.tests = tests
         self.all = {t["number"] for t in tests}
         by_id = {t["id"]: t["number"] for t in tests}
@@ -174,6 +282,60 @@ class Selector:
                     return self.all, ["unknown source: " + path]
                 updated, touched = apply_edit(source, edit)
                 new_tree = ast.parse(updated)
+                old_tree = ast.parse(source)
+                if ast.dump(old_tree) == ast.dump(new_tree):
+                    # Preserve consumers of source text and code metadata. Syntax
+                    # equality alone is not evidence that every test is unaffected.
+                    if re.search(
+                        r"coding\s*[:=]",
+                        "".join(
+                            source.splitlines(True)[:2] + updated.splitlines(True)[:2]
+                        ),
+                    ):
+                        return self.all, ["encoding directive: " + path]
+                    selected.update(readers)
+                    selected.update(
+                        self.translated(self.mapping.get("introspection", []))
+                    )
+                    reasons.append(
+                        "unchanged AST with source-reader retention: " + path
+                    )
+                    continue
+                owners = class_setting_changes(ast.parse(source), ast.parse(updated))
+                if owners:
+                    module = path.removesuffix(".py").replace("/", ".")
+                    class_map = self.mapping.get("classes", {})
+                    keys = [module + ":" + owner for owner in owners]
+                    if all(key in class_map for key in keys):
+                        if not self.import_check(path, updated):
+                            return self.all, ["class import check failed: " + path]
+                        selected.update(readers)
+                        selected.update(
+                            self.translated(self.mapping.get("introspection", []))
+                        )
+                        for node in ast.walk(ast.parse(source)):
+                            if isinstance(node, (ast.Assign, ast.AnnAssign)) and any(
+                                node.lineno <= line <= node.end_lineno
+                                for line in touched
+                            ):
+                                targets = (
+                                    node.targets
+                                    if isinstance(node, ast.Assign)
+                                    else [node.target]
+                                )
+                                for target in targets:
+                                    if isinstance(target, ast.Name):
+                                        selected.update(
+                                            self.translated(
+                                                self.mapping.get("attributes", {}).get(
+                                                    target.id, []
+                                                )
+                                            )
+                                        )
+                        for key in keys:
+                            selected.update(self.translated(class_map[key]))
+                        reasons.append("observed class consumers: " + path)
+                        continue
                 old_structure = ast.dump(Structure().visit(ast.parse(source)))
                 new_structure = ast.dump(Structure().visit(new_tree))
                 if old_structure != new_structure:
@@ -243,6 +405,7 @@ def main():
     parser.add_argument("--no-fill", action="store_true")
     args = parser.parse_args()
     start = time.process_time()
+    children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
     tests = json.loads((args.data / "tests.json").read_text())["tests"]
     with gzip.open(args.map, "rt") as f:
         selector = Selector(json.load(f), tests)
@@ -263,7 +426,19 @@ def main():
             ),
             file=sys.stderr,
         )
-    print(f"CPU seconds: {time.process_time() - start:.4f}", file=sys.stderr)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (
+        time.process_time()
+        - start
+        + children.ru_utime
+        + children.ru_stime
+        - children_start.ru_utime
+        - children_start.ru_stime
+    )
+    print(
+        f"CPU seconds including import checks (excluding interpreter startup): {cpu:.4f}",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
