@@ -10,10 +10,15 @@ output*.jsonl
 # Local development and evaluation assets
 /Makefile
 /SCORING.md
-/requirements.lock
 /sample/
 /score.py
 /tests/
 /maps/manifest.json
 /tools/*
 !/tools/SQLGLOT_LICENSE
+!/tools/build_profile.py
+
+# Private research must never be included by normal staging.
+**/public-research*
+/.codex/
+/.agents/

@@ -8,6 +8,7 @@ import tempfile
 import ast
 import gzip
 import json
+import math
 import re
 import resource
 import sys
@@ -126,46 +127,65 @@ def apply_edit(source, edit):
     return "".join(result), touched
 
 
-class Structure(ast.NodeTransformer):
-    def visit_FunctionDef(self, node):
-        node.body = [ast.Pass()]
-        return node
-
-    visit_AsyncFunctionDef = visit_FunctionDef
+FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
-def literal_shape(value):
-    if isinstance(value, dict):
-        return (dict, tuple((repr(k), literal_shape(v)) for k, v in value.items()))
-    if isinstance(value, (list, tuple)):
-        return (type(value), tuple(literal_shape(v) for v in value))
-    if isinstance(value, (set, frozenset)):
-        return (type(value), len(value))
-    return type(value)
+def same_ast(old, new, *, structure=False, settings=False):
+    """Compare syntax without allocating dumps or modifying cached trees."""
+    pending = [(old, new)]
+    while pending:
+        a, b = pending.pop()
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.AST):
+            for name, av in ast.iter_fields(a):
+                if structure and isinstance(a, FUNCTIONS) and name == "body":
+                    continue
+                bv = getattr(b, name)
+                # A setting may alter literal arguments, including those inside
+                # factory calls and lambdas. Keep names, calls, operators and
+                # dictionary keys intact; initialization is checked separately.
+                if settings and isinstance(a, ast.Constant) and name == "value":
+                    if type(av) is not type(bv):
+                        return False
+                elif settings and isinstance(a, ast.Dict) and name == "keys":
+                    if not same_ast(av, bv):
+                        return False
+                else:
+                    pending.append((av, bv))
+        elif isinstance(a, list):
+            if len(a) != len(b):
+                return False
+            pending.extend(zip(a, b))
+        elif a != b:
+            return False
+    return True
 
 
 def class_setting_changes(old, new):
-    """Accept same-shaped literal settings; leave factory/import edits unresolved."""
+    """Find class settings whose expression only changes literal values."""
     owners = set()
 
     def compare(a, b, owner=None):
-        if ast.dump(a) == ast.dump(b):
-            return True
         if type(a) is not type(b):
             return False
         if isinstance(a, ast.ClassDef):
             owner = (owner + "." if owner else "") + a.name
-        if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return False
+        if isinstance(a, FUNCTIONS):
+            return same_ast(a, b)
         if owner and isinstance(a, (ast.Assign, ast.AnnAssign)):
-            try:
-                av, bv = ast.literal_eval(a.value), ast.literal_eval(b.value)
-            except (ValueError, TypeError, SyntaxError):
+            if same_ast(a, b):
+                return True
+            targets = a.targets if isinstance(a, ast.Assign) else [a.target]
+            if not all(isinstance(target, ast.Name) for target in targets):
                 return False
-            if literal_shape(av) != literal_shape(bv):
+            if not same_ast(a.value, b.value, settings=True):
                 return False
-            a.value = b.value = ast.Constant(None)
-            if ast.dump(a) != ast.dump(b):
+            if any(
+                not same_ast(av, getattr(b, name))
+                for name, av in ast.iter_fields(a)
+                if name != "value"
+            ):
                 return False
             owners.add(owner)
             return True
@@ -198,7 +218,7 @@ class ImportCheck:
         self.directory = None
         self.remaining_seconds = 12.0
 
-    def check(self, path, source):
+    def check(self, path, source, updates=None):
         if self.remaining_seconds <= 0:
             return False
         started = time.monotonic()
@@ -209,18 +229,22 @@ class ImportCheck:
                     target = Path(self.directory.name) / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(text)
-        target = Path(self.directory.name) / path
-        module = path.removesuffix(".py").replace("/", ".")
+        updates = updates or {path: source}
+        modules = [name.removesuffix(".py").replace("/", ".") for name in updates]
         try:
-            target.write_text(source)
+            for name, text in updates.items():
+                target = Path(self.directory.name) / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text)
             result = subprocess.run(
                 [
                     sys.executable,
                     "-B",
                     "-c",
-                    "import sys,importlib;sys.path.insert(0,sys.argv[1]);importlib.import_module(sys.argv[2])",
+                    "import sys,importlib;sys.path.insert(0,sys.argv[1]);"
+                    "[importlib.import_module(name) for name in sys.argv[2:]]",
                     self.directory.name,
-                    module,
+                    *modules,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -232,14 +256,16 @@ class ImportCheck:
             return False
         finally:
             self.remaining_seconds -= time.monotonic() - started
-            target.write_text(self.sources[path])
+            for name in updates:
+                (Path(self.directory.name) / name).write_text(self.sources[name])
 
 
 class Selector:
     def __init__(self, mapping, tests, import_check=None):
         self.mapping = mapping
-        self.import_check = (
-            import_check or ImportCheck(mapping.get("sources", {})).check
+        self.import_check = import_check
+        self.import_environment = (
+            None if import_check is not None else ImportCheck(mapping.get("sources", {}))
         )
         self.tests = tests
         self.all = {t["number"] for t in tests}
@@ -250,25 +276,47 @@ class Selector:
         self.unknown = (self.all - set(self.numbers.values())) | self.translated(
             mapping.get("incomplete", [])
         )
-        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        self.ms = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
+        self.ranked = sorted(self.all, key=lambda n: (-self.ms[n], n))
 
     def translated(self, values):
         return {self.numbers[i] for i in values if i in self.numbers}
 
-    @lru_cache(maxsize=256)
-    def scopes(self, path):
+    @lru_cache(maxsize=32)
+    def analysis(self, path):
         tree = ast.parse(self.mapping["sources"][path])
-        return [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
+        functions, assignments = [], []
+        for node in ast.walk(tree):
+            if isinstance(node, FUNCTIONS):
+                functions.append(node)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                assignments.append(node)
+        return tree, functions, assignments
+
+    @lru_cache(maxsize=256)
+    def scope_dependencies(self, path, start, end):
+        startup = self.mapping.get("startup", {}).get(path, [])
+        initialization = any(start <= line <= end for line in startup)
+        entries = self.mapping["lines"].get(path, {})
+        impacted = self.translated(
+            {i for line in range(start, end + 1) for i in entries.get(str(line), [])}
+        )
+        return initialization, impacted
 
     def select(self, patch):
         selected = set(self.unknown)
         reasons = []
         try:
-            for edit in parse_patch(patch):
+            edits = parse_patch(patch)
+            if len({edit.path for edit in edits}) != len(edits):
+                return self.all, ["repeated file in patch"]
+            updates, touches = {}, {}
+            for edit in edits:
+                source = self.mapping["sources"].get(edit.path)
+                if edit.path.endswith(".py") and source is not None:
+                    updates[edit.path], touches[edit.path] = apply_edit(source, edit)
+            import_ok = None
+            for edit in edits:
                 path = edit.path
                 readers = self.translated(self.mapping["reads"].get(path, []))
                 if not path.endswith(".py"):
@@ -280,10 +328,10 @@ class Selector:
                 source = self.mapping["sources"].get(path)
                 if source is None:
                     return self.all, ["unknown source: " + path]
-                updated, touched = apply_edit(source, edit)
+                updated, touched = updates[path], touches[path]
                 new_tree = ast.parse(updated)
-                old_tree = ast.parse(source)
-                if ast.dump(old_tree) == ast.dump(new_tree):
+                old_tree, functions, assignments = self.analysis(path)
+                if same_ast(old_tree, new_tree):
                     # Preserve consumers of source text and code metadata. Syntax
                     # equality alone is not evidence that every test is unaffected.
                     if re.search(
@@ -301,20 +349,26 @@ class Selector:
                         "unchanged AST with source-reader retention: " + path
                     )
                     continue
-                owners = class_setting_changes(ast.parse(source), ast.parse(updated))
+                owners = class_setting_changes(old_tree, new_tree)
                 if owners:
                     module = path.removesuffix(".py").replace("/", ".")
                     class_map = self.mapping.get("classes", {})
                     keys = [module + ":" + owner for owner in owners]
                     if all(key in class_map for key in keys):
-                        if not self.import_check(path, updated):
+                        if import_ok is None:
+                            import_ok = (
+                                self.import_environment.check(path, updated, updates)
+                                if self.import_environment is not None
+                                else self.import_check(path, updated)
+                            )
+                        if not import_ok:
                             return self.all, ["class import check failed: " + path]
                         selected.update(readers)
                         selected.update(
                             self.translated(self.mapping.get("introspection", []))
                         )
-                        for node in ast.walk(ast.parse(source)):
-                            if isinstance(node, (ast.Assign, ast.AnnAssign)) and any(
+                        for node in assignments:
+                            if any(
                                 node.lineno <= line <= node.end_lineno
                                 for line in touched
                             ):
@@ -325,22 +379,18 @@ class Selector:
                                 )
                                 for target in targets:
                                     if isinstance(target, ast.Name):
-                                        selected.update(
-                                            self.translated(
-                                                self.mapping.get("attributes", {}).get(
-                                                    target.id, []
-                                                )
-                                            )
-                                        )
+                                        qualified = self.mapping.get("qualified_attributes")
+                                        if qualified is None:
+                                            consumers = self.mapping.get("attributes", {}).get(target.id, [])
+                                        else:
+                                            consumers = {i for key in keys for i in qualified.get(key + ":" + target.id, [])}
+                                        selected.update(self.translated(consumers))
                         for key in keys:
                             selected.update(self.translated(class_map[key]))
                         reasons.append("observed class consumers: " + path)
                         continue
-                old_structure = ast.dump(Structure().visit(ast.parse(source)))
-                new_structure = ast.dump(Structure().visit(new_tree))
-                if old_structure != new_structure:
+                if not same_ast(old_tree, new_tree, structure=True):
                     return self.all, ["module/class structure: " + path]
-                functions = self.scopes(path)
                 chosen = set()
                 for line in touched:
                     enclosing = [
@@ -350,14 +400,14 @@ class Selector:
                         return self.all, ["import/definition boundary: " + path]
                     # The outer function includes captured state and nested functions.
                     scope = max(enclosing, key=lambda n: n.end_lineno - n.lineno)
-                    chosen.update(range(scope.body[0].lineno, scope.end_lineno + 1))
-                # Module initialization can create shared state for later tests.
-                if chosen.intersection(self.mapping.get("startup", {}).get(path, [])):
-                    return self.all, ["initialization dependency: " + path]
-                entries = self.mapping["lines"].get(path, {})
-                impacted = self.translated(
-                    {i for line in chosen for i in entries.get(str(line), [])}
-                )
+                    chosen.add((scope.body[0].lineno, scope.end_lineno))
+                impacted = set()
+                for start, end in chosen:
+                    initialization, consumers = self.scope_dependencies(path, start, end)
+                    # Module initialization can create shared state for later tests.
+                    if initialization:
+                        return self.all, ["initialization dependency: " + path]
+                    impacted.update(consumers)
                 if not impacted:
                     impacted = self.translated(self.mapping["files"].get(path, []))
                 if not impacted:
@@ -372,8 +422,13 @@ class Selector:
         if not selected:
             return []
         ranked = sorted(selected, key=lambda n: (-self.ms[n], n))
+        total = sum(self.ms[n] for n in ranked)
+        longest = self.ms[ranked[0]]
         best = None
         for count in range(1, min(8, len(ranked)) + 1):
+            lower_bound = max(longest, (total + count - 1) // count) + 2000 * count
+            if best is not None and lower_bound >= best[0]:
+                continue
             workers = [[] for _ in range(count)]
             loads = [0] * count
             for number in ranked:
@@ -388,7 +443,9 @@ class Selector:
         _, workers, loads = best
         if fill:
             ceiling = max(loads)
-            for number in sorted(self.all - selected, key=lambda n: (-self.ms[n], n)):
+            for number in self.ranked:
+                if number in selected:
+                    continue
                 index = min(range(len(loads)), key=lambda i: loads[i])
                 if loads[index] + self.ms[number] <= ceiling:
                     workers[index].append(number)
@@ -403,29 +460,51 @@ def main():
         "--map", type=Path, default=Path(__file__).parent / "maps/baseline.json.gz"
     )
     parser.add_argument("--no-fill", action="store_true")
+    parser.add_argument("--profile", type=Path, default=Path(__file__).parent / "maps/runtime.json.gz")
+    parser.add_argument("--source", type=Path, default=Path("/app/source"))
+    parser.add_argument("--static", action="store_true")
+    parser.add_argument("--queries", type=Path, default=Path(__file__).parent / "maps/queries.pkl.gz")
+    parser.add_argument("--query-checks", action="store_true")
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
     tests = json.loads((args.data / "tests.json").read_text())["tests"]
+    from runtime import Verifier, load_profile, merge_profile
+
+    profile = load_profile(args.profile)
     with gzip.open(args.map, "rt") as f:
-        selector = Selector(json.load(f), tests)
-    for path in sorted((args.data / "commits").glob("*.patch")):
-        chosen, reasons = selector.select(path.read_text())
-        workers = selector.schedule(chosen, fill=not args.no_fill)
-        print(
-            json.dumps({"commit": path.stem, "workers": workers}, separators=(",", ":"))
-        )
-        print(
-            json.dumps(
-                {
-                    "commit": path.stem,
-                    "selected": len(chosen),
-                    "scheduled": sum(map(len, workers)),
-                    "reasons": reasons,
-                }
-            ),
-            file=sys.stderr,
-        )
+        mapping = json.load(f)
+    merge_profile(mapping, profile)
+    selector = Selector(mapping, tests)
+    verifier = None if args.static else Verifier(args.source, profile, tests, selector.schedule,
+                                               queries=args.queries if args.query_checks else None)
+    try:
+        for path in sorted((args.data / "commits").glob("*.patch")):
+            patch = path.read_text()
+            chosen, reasons = selector.select(patch)
+            if verifier is not None:
+                chosen, checked = verifier.query_refine(patch, chosen)
+                reasons.extend(checked)
+                chosen, checked = verifier.refine(patch, chosen)
+                reasons.extend(checked)
+            workers = selector.schedule(chosen, fill=not args.no_fill)
+            print(
+                json.dumps({"commit": path.stem, "workers": workers}, separators=(",", ":"))
+            )
+            print(
+                json.dumps(
+                    {
+                        "commit": path.stem,
+                        "selected": len(chosen),
+                        "scheduled": sum(map(len, workers)),
+                        "reasons": reasons,
+                    }
+                ),
+                file=sys.stderr,
+            )
+    finally:
+        if verifier is not None:
+            verifier.close()
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu = (
         time.process_time()
