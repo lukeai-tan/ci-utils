@@ -20,6 +20,10 @@ output*.jsonl
 !/tools/build_setting_flow.py
 !/tools/build_comparison_profile.py
 !/tools/build_value_profile.py
+!/tools/build_behavior_profile.py
+!/tools/build_initialization_profile.py
+!/tools/build_timing_profile.py
+!/tools/build_query_timing.py
 
 # Private research must never be included by normal staging.
 **/public-research*

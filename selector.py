@@ -587,6 +587,18 @@ class Selector:
                     initialization, consumers = self.scope_dependencies(path, start, end)
                     # Module initialization can create shared state for later tests.
                     if initialization:
+                        # Complete observations can establish that the changed
+                        # expression leaves initialization itself unchanged.
+                        # Preserve the broad fallback unless that proof exists.
+                        behavior = self.mapping.get("local_behavior")
+                        if behavior is not None and len(edits) == 1:
+                            from behaviorcheck import certified_tests
+                            proven = certified_tests(behavior, updates, self.mapping["sources"], self.tests,
+                                                     trees=trees, require_initialization=True)
+                            protected = set(self.unknown) | readers | self.translated(self.mapping.get("introspection", []))
+                            removable = proven - protected
+                            if removable:
+                                return self.all - removable, ["complete initialization and test observations: " + path]
                         return self.all, ["initialization dependency: " + path]
                     impacted.update(consumers)
                 if narrowed:
@@ -631,6 +643,18 @@ class Selector:
                 if removable:
                     selected.difference_update(removable)
                     reasons.append(f"baseline primitive values certify {len(removable)} comparison consumers")
+            if len(updates) == len(edits) and self.mapping.get("local_behavior"):
+                from behaviorcheck import certified_tests
+
+                proven = certified_tests(self.mapping["local_behavior"], updates,
+                                         self.mapping["sources"], self.tests, trees=trees)
+                retained = set(self.unknown) | self.translated(self.mapping.get("introspection", []))
+                for edit in edits:
+                    retained.update(self.translated(self.mapping["reads"].get(edit.path, [])))
+                removable = selected & (proven - retained)
+                if removable:
+                    selected.difference_update(removable)
+                    reasons.append(f"baseline Boolean or dict identity observations certify {len(removable)} consumers")
         except (ValueError, SyntaxError, KeyError, TypeError, RecursionError) as exc:
             return self.all, ["fallback: " + str(exc)]
         return selected, reasons
@@ -687,11 +711,13 @@ def main():
     parser.add_argument("--values", type=Path, default=Path(__file__).parent / "maps/values.json.gz")
     parser.add_argument("--task-queries", type=Path, default=Path(__file__).parent / "maps/query-values.pkl.gz")
     parser.add_argument("--no-query-replay", action="store_true")
+    parser.add_argument("--behavior", type=Path, default=Path(__file__).parent / "maps/behavior.json.gz")
+    parser.add_argument("--timing", type=Path, default=Path(__file__).parent / "maps/timing.json.gz")
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
     tests = json.loads((args.data / "tests.json").read_text())["tests"]
-    from runtime import Verifier, load_profile, load_setting_flow, merge_profile
+    from runtime import Verifier, load_profile, load_setting_flow, load_timing, merge_profile
 
     profile = load_profile(args.profile)
     with gzip.open(args.map, "rt") as f:
@@ -705,10 +731,16 @@ def main():
     values = LazyProfile(args.values) if args.values.is_file() else None
     if values:
         mapping["literal_values"] = values
+    from behaviorcheck import LazyProfile as LazyBehavior
+    behavior = LazyBehavior(args.behavior) if args.behavior.is_file() else None
+    if behavior:
+        mapping["local_behavior"] = behavior
     selector = Selector(mapping, tests)
     verifier = None if args.static else Verifier(args.source, profile, tests, selector.schedule,
                                                queries=args.queries if args.query_checks else None,
-                                               values=values, task_queries=None if args.no_query_replay else args.task_queries)
+                                               values=values, behavior=behavior,
+                                               timing=load_timing(args.timing),
+                                               task_queries=None if args.no_query_replay else args.task_queries)
     try:
         for path in sorted((args.data / "commits").glob("*.patch")):
             patch = path.read_text()

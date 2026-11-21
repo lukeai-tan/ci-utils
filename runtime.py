@@ -50,6 +50,24 @@ def load_setting_flow(path):
         return None
 
 
+def load_timing(path):
+    from comparisoncheck import REVISION
+    try:
+        with gzip.open(path, "rt") as stream:
+            data = json.load(stream)
+        if (data["revision"] != REVISION or data["version"] != 1 or data["kind"] != "pristine_timing"
+                or data["complete"] is not True or not data["cpu"]):
+            return None
+        for field in ("cpu", "setup", "teardown"):
+            if not isinstance(data[field], dict) or any(type(name) is not str
+                    or type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                    for name, value in data[field].items()):
+                return None
+        return data
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def merge_profile(mapping, profile, setting_flow=None):
     """Add class evidence and distinguish explicit source reads from imports."""
     if not profile or profile.get("incomplete"):
@@ -260,9 +278,10 @@ def serve(base, queries=None, task_queries=None):
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, task_queries=None, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
+        self.timing = timing
         self.tests = {test["number"]: test for test in tests}
         self.by_id = {test["id"]: test["number"] for test in tests}
         self.schedule = schedule
@@ -276,9 +295,10 @@ class Verifier:
         self.queries = Path(queries) if queries is not None else None
         self.query_backend_files = None
         self.values = values
+        self.behavior = behavior
         self.task_queries = Path(task_queries) if task_queries is not None else None
         self.task_baseline = None
-        self.task_available = bool(values and self.task_queries is not None and self.task_queries.is_file())
+        self.task_available = bool((values or behavior) and self.task_queries is not None and self.task_queries.is_file())
         if self.queries is not None and self.queries.is_file():
             from querycheck import load_baseline
             try:
@@ -349,12 +369,16 @@ class Verifier:
                 return selected, []
             old = (self.base / edits[0].path).read_text()
             updated, _ = apply_edit(old, edits[0])
-            if validated_change(self.values, {edits[0].path: updated}, {edits[0].path: old}) is None:
+            change = validated_change(self.values, {edits[0].path: updated}, {edits[0].path: old})
+            if change is None and self.behavior is not None:
+                from behaviorcheck import validated_change as behavior_change
+                change = behavior_change(self.behavior, {edits[0].path: updated}, {edits[0].path: old})
+            if change is None:
                 return selected, []
             if self.task_baseline is None:
                 self.task_baseline = load_profile(self.task_queries)
                 self.close()  # A previously started worker did not load task data.
-            request_plan = plan(self.base, patch, self.values, self.task_baseline)
+            request_plan = plan(self.base, patch, self.values, self.task_baseline, self.behavior)
             if request_plan is None:
                 return selected, []
             indices, estimate = request_plan
@@ -418,10 +442,33 @@ class Verifier:
         if (self.disabled or self.unprofitable >= 2 or not selected
                 or time.monotonic() >= self.deadline or self.used_cpu >= self.cpu_budget):
             return selected, []
+        prices = self.timing["cpu"] if self.timing else self.profile.get("cpu", {})
         candidates = {n for n in selected if self.tests[n]["seconds"] < 3
-                      and self.tests[n]["id"] in self.profile.get("cpu", {})}
-        possible_saving = self.cost(selected) - self.cost(selected - candidates)
-        estimate = 3.0 + sum(max(0.002, self.profile["cpu"][self.tests[n]["id"]]) for n in candidates)
+                      and self.tests[n]["id"] in prices}
+        if self.timing:
+            # A large bundle's whole saving requires many tests to pass. Price
+            # smaller critical bundles as well; unrun tests are always retained.
+            ranked = sorted(candidates, key=lambda n: (-self.tests[n]["seconds"], prices[self.tests[n]["id"]], n))
+            bundles = [candidates] + [{n} for n in ranked[:8]]
+            bundles += [set(ranked[:count]) for count in (2, 4, 8) if len(ranked) > count]
+            choices = []
+            current_cost = self.cost(selected)
+            for bundle in bundles:
+                if not bundle:
+                    continue
+                owners = {self.tests[n]["id"].rsplit("::", 1)[0] for n in bundle}
+                estimate = 1.0 + sum(max(0.002, prices[self.tests[n]["id"]]) for n in bundle)
+                estimate += sum(self.timing["setup"].get(owner, 0) + self.timing["teardown"].get(owner, 0) for owner in owners)
+                saving = current_cost - self.cost(selected - bundle)
+                expected = saving * 0.7 ** min(len(bundle), 4) - estimate
+                if expected > 0.1:
+                    choices.append((expected, saving, estimate, bundle))
+            if not choices:
+                return selected, []
+            _, possible_saving, estimate, candidates = max(choices, key=lambda choice: (choice[0], -len(choice[3])))
+        else:
+            possible_saving = self.cost(selected) - self.cost(selected - candidates)
+            estimate = 3.0 + sum(max(0.002, prices[self.tests[n]["id"]]) for n in candidates)
         if not candidates or possible_saving < estimate + 0.5:
             return selected, []
         budget = min(self.cpu_budget - self.used_cpu, 8.0, max(3.5, estimate * 1.5))
