@@ -360,6 +360,64 @@ class Selector:
         self.ms = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
         self.ranked = sorted(self.all, key=lambda n: (-self.ms[n], n))
 
+    def setting_flow_consumers(self, old, new, path, fallback):
+        """Use complete measured forwarding only for unchanged literal construction."""
+        profile = self.mapping.get("setting_flow")
+        if not profile:
+            return None
+        by_id = {test["id"]: test["number"] for test in self.tests}
+        numbers = {i: by_id[name] for i, name in enumerate(profile["tests"]) if name in by_id}
+        module = path.removesuffix(".py").replace("/", ".")
+        changes = []
+
+        def walk(a, b, owner=""):
+            if isinstance(a, ast.ClassDef):
+                owner = (owner + "." if owner else "") + a.name
+            if isinstance(a, FUNCTIONS):
+                return
+            if owner and isinstance(a, (ast.Assign, ast.AnnAssign)) and not same_ast(a, b):
+                targets = a.targets if isinstance(a, ast.Assign) else [a.target]
+                if not literal_setting_value(a.value) or not literal_setting_value(b.value):
+                    raise ValueError("nonliteral forwarding")
+                for target in targets:
+                    if not isinstance(target, ast.Name):
+                        raise ValueError("unsupported forwarding target")
+                    changes.append((module + ":" + owner + ":" + target.id, a.value, b.value))
+                return
+            for ac, bc in zip(ast.iter_child_nodes(a), ast.iter_child_nodes(b)):
+                walk(ac, bc, owner)
+
+        try:
+            walk(old, new)
+            if not changes:
+                return None
+            consumers = set()
+            for key, before, after in changes:
+                if (key not in profile["known"] or key in profile["blocked"]
+                        or key.rsplit(":", 1)[0] not in self.mapping.get("setting_precise_classes", [])
+                        or key.rsplit(":", 1)[-1].startswith("__")):
+                    return None
+                consumers.update(profile["consumers"].get(key, []))
+                if isinstance(before, ast.Dict):
+                    names = [node.value for node in before.keys if isinstance(node, ast.Constant) and type(node.value) is str]
+                    updated_names = [node.value for node in after.keys if isinstance(node, ast.Constant) and type(node.value) is str]
+                    if len(names) != len(before.keys) or len(set(names)) != len(names) or names != updated_names:
+                        return None
+                    entries = profile.get("entries", {}).get(key, {})
+                    for name, av, bv in zip(names, before.values, after.values):
+                        if not same_ast(av, bv):
+                            consumers.update(entries.get(name, []))
+                else:
+                    consumers.update(i for ids in profile.get("entries", {}).get(key, {}).values() for i in ids)
+            # Failed/unsupported children and unknown cores retain their contexts.
+            consumers.update(set(profile.get("untrusted", [])) - set(profile.get("uninstrumented", [])))
+            retained = {numbers[i] for i in consumers if i in numbers}
+            retained.update(fallback & {numbers[i] for i in profile.get("uninstrumented", []) if i in numbers})
+            retained.update(set(by_id.values()) - set(numbers.values()))
+            return retained
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+
     def translated(self, values):
         return {self.numbers[i] for i in values if i in self.numbers}
 
@@ -448,6 +506,12 @@ class Selector:
                         selected.update(
                             self.translated(self.mapping.get("introspection", []))
                         )
+                        broad = {number for key in keys for number in self.translated(class_map[key])}
+                        flow_consumers = self.setting_flow_consumers(old_tree, new_tree, path, broad)
+                        if flow_consumers is not None:
+                            selected.update(flow_consumers)
+                            reasons.append("forwarded setting readers: " + path)
+                            continue
                         setting_keys = set()
                         literal_settings = True
                         for node in assignments:
@@ -570,6 +634,7 @@ def main():
     )
     parser.add_argument("--no-fill", action="store_true")
     parser.add_argument("--profile", type=Path, default=Path(__file__).parent / "maps/runtime.json.gz")
+    parser.add_argument("--setting-flow", type=Path, default=Path(__file__).parent / "maps/settings.json.gz")
     parser.add_argument("--source", type=Path, default=Path("/app/source"))
     parser.add_argument("--static", action="store_true")
     parser.add_argument("--queries", type=Path, default=Path(__file__).parent / "maps/queries.pkl.gz")
@@ -578,12 +643,12 @@ def main():
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
     tests = json.loads((args.data / "tests.json").read_text())["tests"]
-    from runtime import Verifier, load_profile, merge_profile
+    from runtime import Verifier, load_profile, load_setting_flow, merge_profile
 
     profile = load_profile(args.profile)
     with gzip.open(args.map, "rt") as f:
         mapping = json.load(f)
-    merge_profile(mapping, profile)
+    merge_profile(mapping, profile, load_setting_flow(args.setting_flow))
     selector = Selector(mapping, tests)
     verifier = None if args.static else Verifier(args.source, profile, tests, selector.schedule,
                                                queries=args.queries if args.query_checks else None)

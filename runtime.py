@@ -31,7 +31,26 @@ def load_profile(path):
         return None
 
 
-def merge_profile(mapping, profile):
+def load_setting_flow(path):
+    try:
+        with gzip.open(path, "rt") as source:
+            profile = json.load(source)
+        if (profile["revision"] != REVISION or profile["version"] != 1
+                or profile.get("kind") != "setting_flow" or profile["incomplete"]):
+            return None
+        uninstrumented = set(profile["uninstrumented"])
+        if (not uninstrumented <= set(range(len(profile["tests"])))
+                or any(name not in profile["cpu"] for i, name in enumerate(profile["tests"])
+                       if i not in uninstrumented)
+                or not isinstance(profile["known"], list) or not isinstance(profile["blocked"], list)
+                or not isinstance(profile["consumers"], dict) or not isinstance(profile["entries"], dict)):
+            return None
+        return profile
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def merge_profile(mapping, profile, setting_flow=None):
     """Add class evidence and distinguish explicit source reads from imports."""
     if not profile or profile.get("incomplete"):
         return
@@ -70,6 +89,8 @@ def merge_profile(mapping, profile):
     resolved = {numbers[i] for i in complete}
     failed = {numbers[i] for i in profile.get("child_failed", []) if i in numbers}
     mapping["incomplete"] = sorted((set(mapping.get("incomplete", [])) - resolved) | failed)
+    if setting_flow:
+        mapping["setting_flow"] = setting_flow
 
 
 class PatchedTree:
@@ -192,7 +213,8 @@ def serve(base, queries=None):
                             signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError("query CPU budget")))
                             signal.setitimer(signal.ITIMER_PROF, request["cpu_limit"])
                             result = run_boundaries(tree.root, baseline=query_baseline,
-                                                    methods=[name.rsplit("::", 1)[-1] for name in request["tests"]])
+                                                    methods=[name.rsplit("::", 1)[-1] for name in request["tests"]],
+                                                    changed_files=[edit.path for edit in tree.edits])
                         else:
                             result = run_tests(tree.root, request["tests"], request["cpu_limit"])
                         payload = json.dumps(result).encode()

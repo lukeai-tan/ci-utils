@@ -22,27 +22,44 @@ METHODS = ("test_execute_tpch", "test_execute_tpcds")
 
 
 class SerialFuture(concurrent.futures.Future):
-    def __init__(self, function, args, kwargs):
+    def __init__(self, function, args, kwargs, observer=None, index=0):
         super().__init__()
         self.work = (function, args, kwargs)
+        self.observer = observer
+        self.index = index
 
     def result(self, timeout=None):
         if not self.done():
             function, args, kwargs = self.work
+            previous = sys.getprofile()
             try:
+                if self.observer is not None:
+                    self.observer.begin(self.index)
+                    if self.observer.recording is not None:
+                        sys.setprofile(self.observer.trace)
                 self.set_result(pickle.loads(pickle.dumps(function(*args, **kwargs))))
             except BaseException as error:
                 self.set_exception(error)
+            finally:
+                sys.setprofile(previous)
+                if self.observer is not None:
+                    self.observer.end()
         return super().result(timeout)
 
 
 class SerialPool:
+    stage_observer = None
+
     def __init__(self, initializer=None, initargs=(), **kwargs):
+        self.index = 0
         if initializer:
             initializer(*pickle.loads(pickle.dumps(initargs)))
 
     def submit(self, function, *args, **kwargs):
-        return SerialFuture(*pickle.loads(pickle.dumps((function, args, kwargs))))
+        future = SerialFuture(*pickle.loads(pickle.dumps((function, args, kwargs))),
+                              observer=self.stage_observer, index=self.index)
+        self.index += 1
+        return future
 
     def __enter__(self):
         return self
@@ -111,6 +128,96 @@ def freeze_code(code):
         constants.append(freeze_code(value) if isinstance(value, types.CodeType) else freeze(value))
     return [code.co_code.hex(), list(code.co_names), list(code.co_varnames), constants,
             code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount, code.co_flags]
+
+
+class StageObserver:
+    """Reject divergent affected stages; matching stages never certify a pass."""
+
+    def __init__(self, root, *, recording=None, baseline=None, changed_files=()):
+        from sqlglot.optimizer.optimizer import RULES, optimize
+
+        self.root = str(root) + os.sep
+        self.recording = recording
+        self.baseline = baseline or {}
+        self.changed = set(changed_files)
+        self.optimizer = optimize.__code__
+        self.rules = {rule.__code__ for rule in RULES}
+        self.method = None
+        self.query = None
+        self.index = 0
+        self.frames = {}
+        self.checked = 0
+        self.monitor_id = None
+
+    def begin(self, query):
+        self.query = query
+        self.index = 0
+        self.frames.clear()
+
+    def end(self):
+        self.query = None
+
+    def open(self):
+        if self.recording is not None:
+            return True
+        monitoring = getattr(sys, "monitoring", None)
+        if monitoring is None:
+            return False
+        identifier = next((i for i in range(5, -1, -1) if monitoring.get_tool(i) is None), None)
+        if identifier is None:
+            return False
+        monitoring.use_tool_id(identifier, "query-stage-rejection")
+        self.monitor_id = identifier
+        monitoring.register_callback(identifier, monitoring.events.PY_START, self.enter)
+        monitoring.register_callback(identifier, monitoring.events.PY_RETURN, self.leave)
+        for code in self.rules:
+            monitoring.set_local_events(identifier, code, monitoring.events.PY_START | monitoring.events.PY_RETURN)
+        return True
+
+    def close(self):
+        if self.monitor_id is not None:
+            for code in self.rules:
+                sys.monitoring.set_local_events(self.monitor_id, code, 0)
+            sys.monitoring.register_callback(self.monitor_id, sys.monitoring.events.PY_START, None)
+            sys.monitoring.register_callback(self.monitor_id, sys.monitoring.events.PY_RETURN, None)
+            sys.monitoring.free_tool_id(self.monitor_id)
+            self.monitor_id = None
+
+    def enter(self, code, offset):
+        if self.query is not None:
+            self.trace(sys._getframe(1), "call", None)
+
+    def leave(self, code, offset, value):
+        if self.query is not None:
+            self.trace(sys._getframe(1), "return", value)
+
+    def trace(self, frame, event, value):
+        if event == "call":
+            if (frame.f_code in self.rules and frame.f_back is not None
+                    and frame.f_back.f_code is self.optimizer):
+                key = (self.method, self.query, self.index)
+                self.index += 1
+                self.frames[id(frame)] = [key, set(), frame.f_code.co_name]
+            if self.recording is not None and self.frames:
+                filename = frame.f_code.co_filename
+                if filename.startswith(self.root + "sqlglot/"):
+                    for _, files, _ in self.frames.values():
+                        files.add(filename[len(self.root):])
+        elif event == "return" and id(frame) in self.frames:
+            key, files, name = self.frames.pop(id(frame))
+            reference = self.baseline.get(key)
+            if self.recording is None and (reference is None or not self.changed.intersection(reference[0])):
+                return
+            # This is an additional rejection gate. Input, shared-table state,
+            # hash caches and final results still undergo the full verifier.
+            digest = hashlib.sha256(json.dumps(freeze(value), separators=(",", ":"),
+                                               ensure_ascii=True).encode()).hexdigest()
+            if self.recording is not None:
+                self.recording[key] = (sorted(files), name, digest)
+            elif reference[1] != name or reference[2] != digest:
+                raise KeyboardInterrupt("affected optimizer stage changed")
+            else:
+                self.checked += 1
 
 
 def boundary(executor, plan):
@@ -223,7 +330,7 @@ def supported_patch(base, patch, backend_files=()):
         return False
 
 
-def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS):
+def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS, changed_files=()):
     os.chdir(root)
     sys.path.insert(0, str(root))
     os.environ.update(SKIP_INTEGRATION="0", PYTHON_CPU_COUNT="2", OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1")
@@ -234,8 +341,16 @@ def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS):
     tests.ProcessPoolExecutor = SerialPool
     original_backend = PythonExecutor.execute
     original_expected = tests.TestExecutor.cached_execute
-    backend_rows = {} if recording is not None else baseline["backend"]
-    expected_rows = {} if recording is not None else baseline["expected"]
+    record_backend = recording is not None and baseline is None
+    backend_rows = {} if record_backend else baseline["backend"]
+    expected_rows = {} if record_backend else baseline["expected"]
+    stage_rows = {} if recording is not None else None
+    observer = StageObserver(root, recording=stage_rows,
+                             baseline=(baseline or {}).get("stages"), changed_files=changed_files)
+    previous_observer = SerialPool.stage_observer
+    # Old baselines keep their original replay path and avoid profiling overhead.
+    observing = recording is not None or baseline.get("stages") and changed_files
+    SerialPool.stage_observer = observer if observing and observer.open() else None
     matched = set()
     backend_files = set()
     source_prefix = str(root) + os.sep
@@ -248,11 +363,11 @@ def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS):
 
     def execute(executor, plan, outer_scope=None):
         if outer_scope is not None:
-            if recording is not None:
+            if record_backend:
                 return original_backend(executor, plan, outer_scope)
             raise KeyboardInterrupt("nested backend boundary")
         fingerprint = boundary(executor, plan)
-        if recording is not None:
+        if record_backend:
             before = {name: pickle.dumps(table, protocol=5) for name, table in executor.tables.mapping.items()}
             previous = sys.getprofile()
             sys.setprofile(backend_calls)
@@ -281,7 +396,7 @@ def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS):
     def expected(instance, sql, tpch=True):
         backend_sql = transpile(sql, write="duckdb")[0]
         key = (tpch, sql)
-        if recording is not None:
+        if record_backend:
             result = original_expected(instance, sql, tpch)
             expected_rows[key] = (backend_sql, pickle.dumps(result, protocol=5))
             return result
@@ -295,6 +410,7 @@ def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS):
     try:
         tests.TestExecutor.setUpClass()
         for method in methods:
+            observer.method = method
             result = unittest.TestResult()
             tests.TestExecutor(method).run(result)
             if result.wasSuccessful() and result.testsRun == 1 and not result.skipped:
@@ -309,10 +425,13 @@ def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS):
         tests.TestExecutor.tearDownClass()
         PythonExecutor.execute = original_backend
         tests.TestExecutor.cached_execute = original_expected
+        SerialPool.stage_observer = previous_observer
+        observer.close()
     if recording is not None:
         recording.update(revision=REVISION, version=3, backend=backend_rows, expected=expected_rows,
-                         methods=passed, backend_files=sorted(backend_files))
-    return {"passed": passed, "matched_boundaries": len(matched)}
+                         methods=passed, backend_files=sorted(backend_files if record_backend else baseline["backend_files"]),
+                         stages=stage_rows)
+    return {"passed": passed, "matched_boundaries": len(matched), "checked_stages": observer.checked}
 
 
 def load_baseline(path):
@@ -332,13 +451,15 @@ if __name__ == "__main__":
                                        env={**os.environ, "PYTHONHASHSEED": "0", "PYTHON_CPU_COUNT": "2"}).returncode)
     parser = argparse.ArgumentParser()
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--build-stages", type=Path, help="augment a verified boundary map using pristine replay")
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    if args.build:
+    if args.build or args.build_stages:
         output = args.out.resolve()
         recording = {}
-        result = run_boundaries(args.source.resolve(), recording=recording)
+        result = run_boundaries(args.source.resolve(), recording=recording,
+                                baseline=load_baseline(args.build_stages) if args.build_stages else None)
         output.parent.mkdir(parents=True, exist_ok=True)
         with gzip.GzipFile(filename=str(output), mode="wb", mtime=0) as stream:
             pickle.dump(recording, stream, protocol=5)

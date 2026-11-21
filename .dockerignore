@@ -5,6 +5,7 @@
 !maps/
 !maps/baseline.json.gz
 !maps/runtime.json.gz
+!maps/settings.json.gz
 !maps/queries.pkl.gz
 !requirements.lock
 !LICENSE

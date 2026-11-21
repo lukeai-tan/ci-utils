@@ -17,6 +17,7 @@ output*.jsonl
 /tools/*
 !/tools/SQLGLOT_LICENSE
 !/tools/build_profile.py
+!/tools/build_setting_flow.py
 
 # Private research must never be included by normal staging.
 **/public-research*
