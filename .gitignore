@@ -5,7 +5,7 @@ output*.jsonl
 *.log
 .ruff_cache/
 
-/README.md
+/README.local.md
 
 # Local development and evaluation assets
 /Makefile
