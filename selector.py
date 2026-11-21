@@ -210,6 +210,74 @@ def class_setting_changes(old, new):
     return owners if compare(old, new) else set()
 
 
+def value_change_scopes(old, new):
+    """Find statements affected by literal/operator edits inside function bodies.
+
+    Keep bindings, expression shape, definitions and control-flow statements
+    intact. A test must execute an affected statement to observe these edits.
+    More general edits still use the enclosing function's dependencies.
+    """
+    scopes = set()
+    operators = (ast.operator, ast.unaryop, ast.boolop, ast.cmpop)
+
+    def compare(a, b, statement=None, in_function=False):
+        if isinstance(a, operators) and isinstance(b, operators):
+            if not any(isinstance(a, family) and isinstance(b, family) for family in operators):
+                return False
+            if type(a) is not type(b):
+                if not in_function or statement is None:
+                    return False
+                scopes.add((statement.lineno, statement.end_lineno))
+            return True
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.AST):
+            if isinstance(a, FUNCTIONS) and any(
+                isinstance(node, (*FUNCTIONS, ast.Lambda, ast.ClassDef, ast.Global, ast.Nonlocal))
+                for child in a.body for node in ast.walk(child)
+            ):
+                # Captured values may be consumed after the outer call, and
+                # explicit shared bindings can affect later calls elsewhere.
+                return same_ast(a, b)
+            if isinstance(a, ast.stmt):
+                statement = a
+            for name, av in ast.iter_fields(a):
+                bv = getattr(b, name)
+                if isinstance(a, FUNCTIONS):
+                    if name != "body":
+                        if not same_ast(av, bv):
+                            return False
+                        continue
+                    if not compare(av, bv, statement, True):
+                        return False
+                elif isinstance(a, ast.ClassDef):
+                    # Class bodies, even inside a function, execute when the
+                    # definition is reached and may feed metaclass state.
+                    if in_function or name != "body":
+                        if not same_ast(av, bv):
+                            return False
+                    elif not compare(av, bv, statement, False):
+                        return False
+                elif isinstance(a, ast.Constant) and name == "value" and av != bv:
+                    if (type(av) is not type(bv) or not in_function
+                            or statement is None or isinstance(statement, FUNCTIONS)):
+                        return False
+                    # Docstrings are observable without executing their line.
+                    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+                        return False
+                    scopes.add((statement.lineno, statement.end_lineno))
+                elif not compare(av, bv, statement, in_function):
+                    return False
+            return True
+        if isinstance(a, list):
+            return len(a) == len(b) and all(
+                compare(x, y, statement, in_function) for x, y in zip(a, b)
+            )
+        return a == b
+
+    return scopes if compare(old, new) else None
+
+
 class ImportCheck:
     """Use a fresh interpreter to check changed class initialization."""
 
@@ -391,6 +459,7 @@ class Selector:
                         continue
                 if not same_ast(old_tree, new_tree, structure=True):
                     return self.all, ["module/class structure: " + path]
+                value_scopes = value_change_scopes(old_tree, new_tree)
                 chosen = set()
                 for line in touched:
                     enclosing = [
@@ -402,18 +471,31 @@ class Selector:
                     scope = max(enclosing, key=lambda n: n.end_lineno - n.lineno)
                     chosen.add((scope.body[0].lineno, scope.end_lineno))
                 impacted = set()
+                narrowed = value_scopes is not None and bool(value_scopes)
                 for start, end in chosen:
                     initialization, consumers = self.scope_dependencies(path, start, end)
                     # Module initialization can create shared state for later tests.
                     if initialization:
                         return self.all, ["initialization dependency: " + path]
                     impacted.update(consumers)
+                if narrowed:
+                    statement_consumers = set()
+                    for start, end in value_scopes:
+                        _, consumers = self.scope_dependencies(path, start, end)
+                        # Missing statement evidence cannot establish safety.
+                        if not consumers:
+                            narrowed = False
+                            break
+                        statement_consumers.update(consumers)
+                    if narrowed:
+                        impacted = statement_consumers
+                        selected.update(self.translated(self.mapping.get("introspection", [])))
                 if not impacted:
                     impacted = self.translated(self.mapping["files"].get(path, []))
                 if not impacted:
                     return self.all, ["missing coverage: " + path]
                 selected.update(impacted | readers)
-                reasons.append("function: " + path)
+                reasons.append(("statement values: " if narrowed else "function: ") + path)
         except (ValueError, SyntaxError, KeyError, TypeError, RecursionError) as exc:
             return self.all, ["fallback: " + str(exc)]
         return selected, reasons
