@@ -163,7 +163,12 @@ def same_ast(old, new, *, structure=False, settings=False):
 
 
 def class_setting_changes(old, new):
-    """Find class settings whose expression only changes literal values."""
+    """Find class settings that preserve construction or use pure literals.
+
+    Literal containers may change their keys or size without adding calls,
+    bindings, or attribute access during class initialization. Those edits
+    require the class's full consumer set, including inherited consumers.
+    """
     owners = set()
 
     def compare(a, b, owner=None):
@@ -179,7 +184,13 @@ def class_setting_changes(old, new):
             targets = a.targets if isinstance(a, ast.Assign) else [a.target]
             if not all(isinstance(target, ast.Name) for target in targets):
                 return False
-            if not same_ast(a.value, b.value, settings=True):
+            literal_container = (
+                isinstance(a.value, (ast.Dict, ast.List, ast.Tuple, ast.Set))
+                and type(a.value) is type(b.value)
+                and literal_setting_value(a.value)
+                and literal_setting_value(b.value)
+            )
+            if not literal_container and not same_ast(a.value, b.value, settings=True):
                 return False
             if any(
                 not same_ast(av, getattr(b, name))
@@ -449,7 +460,7 @@ class Selector:
             edits = parse_patch(patch)
             if len({edit.path for edit in edits}) != len(edits):
                 return self.all, ["repeated file in patch"]
-            updates, touches = {}, {}
+            updates, touches, trees = {}, {}, {}
             for edit in edits:
                 source = self.mapping["sources"].get(edit.path)
                 if edit.path.endswith(".py") and source is not None:
@@ -470,6 +481,7 @@ class Selector:
                 updated, touched = updates[path], touches[path]
                 new_tree = ast.parse(updated)
                 old_tree, functions, assignments = self.analysis(path)
+                trees[path] = old_tree, new_tree
                 if same_ast(old_tree, new_tree):
                     # Preserve consumers of source text and code metadata. Syntax
                     # equality alone is not evidence that every test is unaffected.
@@ -490,6 +502,10 @@ class Selector:
                     continue
                 owners = class_setting_changes(old_tree, new_tree)
                 if owners:
+                    # Entry/size changes can affect iteration, membership, and
+                    # derived initialization. Existing per-value evidence is
+                    # only valid when the construction's shape is preserved.
+                    setting_shape_changed = not same_ast(old_tree, new_tree, settings=True)
                     module = path.removesuffix(".py").replace("/", ".")
                     class_map = self.mapping.get("classes", {})
                     keys = [module + ":" + owner for owner in owners]
@@ -507,7 +523,10 @@ class Selector:
                             self.translated(self.mapping.get("introspection", []))
                         )
                         broad = {number for key in keys for number in self.translated(class_map[key])}
-                        flow_consumers = self.setting_flow_consumers(old_tree, new_tree, path, broad)
+                        flow_consumers = (
+                            None if setting_shape_changed else
+                            self.setting_flow_consumers(old_tree, new_tree, path, broad)
+                        )
                         if flow_consumers is not None:
                             selected.update(flow_consumers)
                             reasons.append("forwarded setting readers: " + path)
@@ -535,7 +554,8 @@ class Selector:
                                             consumers = {i for key in keys for i in qualified.get(key + ":" + target.id, [])}
                                         selected.update(self.translated(consumers))
                         precise = (
-                            self.mapping.get("attribute_complete", False)
+                            not setting_shape_changed
+                            and self.mapping.get("attribute_complete", False)
                             and literal_settings
                             and all(key in self.mapping.get("setting_precise_classes", []) for key in keys)
                             and bool(setting_keys)
@@ -591,7 +611,7 @@ class Selector:
                 from comparisoncheck import certified_tests
 
                 proven = certified_tests(self.mapping["comparison_types"], updates,
-                                         self.mapping["sources"], self.tests)
+                                         self.mapping["sources"], self.tests, trees=trees)
                 retained = set(self.unknown) | self.translated(self.mapping.get("introspection", []))
                 for edit in edits:
                     retained.update(self.translated(self.mapping["reads"].get(edit.path, [])))

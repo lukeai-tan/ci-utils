@@ -135,15 +135,27 @@ def load_comparison_profile(path):
     try:
         with gzip.open(path, "rt") as stream:
             profile = json.load(stream)
-        if (profile["revision"] != REVISION or profile["version"] not in (1, 2)
+        if (profile["revision"] != REVISION or profile["version"] not in (1, 2, 3)
                 or profile["kind"] != "comparison_types" or not profile["collection_complete"]
                 or "startup" in profile.get("bad", [])
-                or not isinstance(profile["sources"], dict) or not isinstance(profile["operands"], dict)
+                or not isinstance(profile["sources"], dict)
                 or len(profile["tests"]) != len(set(profile["tests"]))):
             return None
         complete = set(profile["complete"])
         if (not complete <= set(range(len(profile["tests"])))
                 or not all(profile["tests"][i] in profile["cpu"] for i in complete)):
+            return None
+        if profile["version"] == 3:
+            # The offline builder applies the same type proof once for every
+            # baseline source location. No edit or alternative result is used.
+            if not isinstance(profile["certified"], dict) or any(
+                not isinstance(key, str) or not isinstance(contexts, list)
+                or any(type(i) is not int or i not in complete for i in contexts)
+                for key, contexts in profile["certified"].items()
+            ):
+                return None
+            return profile
+        if not isinstance(profile["operands"], dict):
             return None
         if profile["version"] == 2:
             pairs = profile["pairs"]
@@ -168,7 +180,7 @@ def load_comparison_profile(path):
         return None
 
 
-def certified_tests(profile, updates, originals, catalog):
+def certified_tests(profile, updates, originals, catalog, *, trees=None):
     """Every edited comparison must have safe evidence in each removed context."""
     if not profile:
         return set()
@@ -176,7 +188,8 @@ def certified_tests(profile, updates, originals, catalog):
     for path, updated in updates.items():
         if profile["sources"].get(path) != source_hash(originals[path]):
             return set()
-        found = comparison_changes(ast.parse(originals[path]), ast.parse(updated), path)
+        old, new = trees[path] if trees is not None else (ast.parse(originals[path]), ast.parse(updated))
+        found = comparison_changes(old, new, path)
         if not found:
             return set()
         # Identity comparisons with folded literals can change import warnings
@@ -192,6 +205,12 @@ def certified_tests(profile, updates, originals, catalog):
         return set()
     safe_contexts = set(profile["complete"])
     for key in changes:
+        if profile["version"] == 3:
+            contexts = profile["certified"].get(key)
+            if not contexts:
+                return set()
+            safe_contexts.intersection_update(contexts)
+            continue
         contexts = profile["operands"].get(key)
         if not contexts:
             return set()

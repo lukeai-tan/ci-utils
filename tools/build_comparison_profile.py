@@ -23,7 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from comparisoncheck import COMPARISONS, REVISION, location, operand_types, source_hash
+from comparisoncheck import COMPARISONS, REVISION, identity_equality_pair, location, operand_types, source_hash
 
 
 OPERATORS = {"Eq": operator.eq, "NotEq": operator.ne, "Is": operator.is_, "IsNot": operator.is_not}
@@ -44,6 +44,29 @@ def compact_profile(data):
                 operands={key: {context: sorted(indices[tuple(tuple(value) for value in pair)] for pair in observed)
                                 for context, observed in contexts.items()}
                           for key, contexts in data["operands"].items()})
+
+
+def compile_profile(data):
+    """Compile universal type equivalence from complete pristine observations.
+
+    Each entry describes a source comparison and its baseline contexts. Unsafe
+    startup observations block that location. This is independent of any edit,
+    and is equivalent to checking all operand pairs in the runtime selector.
+    """
+    complete = set(data["complete"])
+    certified = {}
+    for key, contexts in data["operands"].items():
+        if any(not identity_equality_pair(pair) for pair in contexts.get("startup", [])):
+            continue
+        certified[key] = sorted(
+            int(context) for context, pairs in contexts.items()
+            if context != "startup" and int(context) in complete and pairs
+            and all(identity_equality_pair(pair) for pair in pairs)
+        )
+    profile = {key: data[key] for key in ("revision", "kind", "tests", "sources",
+                                         "complete", "cpu", "collection_complete")}
+    profile.update(version=3, bad=data.get("bad", []), certified=certified)
+    return profile
 
 
 class Recorder:
@@ -245,7 +268,7 @@ def main():
                               "-p", "pytest_timeout", "--timeout=300"], plugins=[recorder]) if selected else 0
         output.parent.mkdir(parents=True, exist_ok=True)
         with gzip.GzipFile(filename=str(output), mode="wb", mtime=0) as stream:
-            stream.write(json.dumps(compact_profile(recorder.data()), separators=(",", ":"), sort_keys=True).encode())
+            stream.write(json.dumps(compile_profile(recorder.data()), separators=(",", ":"), sort_keys=True).encode())
         print("Comparison types", len(recorder.operands), "complete", len(recorder.complete),
               "of", len(catalog), "bad", len(recorder.bad), file=sys.stderr)
         raise SystemExit(result)
