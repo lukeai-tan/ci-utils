@@ -355,7 +355,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None, sta
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, aggressive_min_cpu=4.0, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, aggressive_min_cpu=4.0, aggressive_broad=False, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -379,6 +379,7 @@ class Verifier:
         self.progressive = progressive
         self.aggressive = aggressive
         self.aggressive_min_cpu = aggressive_min_cpu
+        self.aggressive_broad = aggressive_broad
         self.aggressive_cpu = 0.0
         self.aggressive_attempted = set()
         self.fixture_delta = fixture_delta
@@ -753,7 +754,7 @@ class Verifier:
             return selected, ["query verification unavailable; retained candidates"]
 
     def aggressive_refine(self, patch, selected, *, protected=()):
-        """Speculate about unrun expensive tests only after a completed clean probe.
+        """Speculate about unrun tests only after a completed clean probe.
 
         Passing a sample does not certify the omitted tests. This separate,
         opt-in policy trades that risk against their simulated schedule cost.
@@ -825,8 +826,13 @@ class Verifier:
                      and not result.get('incomplete') and 'error' not in result
                      and set(result.get('passed', [])) == set(names))
             if clean:
-                return selected - passed - expensive, [
-                    f'aggressive: {len(passed)} clean probes; speculatively omitted {len(expensive)} unrun expensive tests']
+                # Broad omission reuses the same probe and activation gates.
+                # Protected tests and absent timing evidence remain selected.
+                omitted = ({n for n in eligible - passed if self.tests[n]['id'] in prices}
+                           if self.aggressive_broad else expensive)
+                kind = 'profiled' if self.aggressive_broad else 'expensive'
+                return selected - passed - omitted, [
+                    f'aggressive: {len(passed)} clean probes; speculatively omitted {len(omitted)} unrun {kind} tests']
             return selected - passed, [
                 f'aggressive: {len(passed)} passed, {len(result.get("failed", []))} failed; '
                 'probe failed or incomplete, retained expensive tests']
