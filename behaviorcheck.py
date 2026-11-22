@@ -172,7 +172,12 @@ class LazyProfile:
         return self.data
 
 
-def load_profile(path):
+def load_profile(path, *, use_cache=True):
+    if use_cache:
+        from profilecache import load
+        cached = load(path, 'behavior')
+        if cached is not None:
+            return cached
     try:
         with gzip.open(path, "rt") as stream:
             data = json.load(stream)

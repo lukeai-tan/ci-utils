@@ -322,10 +322,35 @@ def value_change_scopes(old, new):
 class ImportCheck:
     """Use a fresh interpreter to check changed class initialization."""
 
-    def __init__(self, sources):
+    def __init__(self, sources, base=None):
         self.sources = sources
+        self.base = Path(base).resolve() if base is not None else None
         self.directory = None
         self.remaining_seconds = 12.0
+
+    def link_caches(self):
+        """Reuse only checked bytecode tied to this exact pristine source."""
+        if self.base is None:
+            return
+        from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
+
+        for name, text in self.sources.items():
+            if not name.startswith('sqlglot/') or not name.endswith('.py'):
+                continue
+            cache = Path(cache_from_source(str(self.base / name)))
+            try:
+                with cache.open('rb') as stream:
+                    header = stream.read(16)
+                if (header[:4] != MAGIC_NUMBER
+                        or int.from_bytes(header[4:8], 'little') != 3
+                        or header[8:16] != source_hash(text.encode('utf-8'))):
+                    continue
+                target = Path(cache_from_source(str(Path(self.directory.name) / name)))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(cache)
+            except (OSError, ValueError):
+                # An unavailable cache leaves the existing source import path.
+                continue
 
     def check(self, path, source, updates=None):
         if self.remaining_seconds <= 0:
@@ -338,6 +363,7 @@ class ImportCheck:
                     target = Path(self.directory.name) / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(text)
+            self.link_caches()
         updates = updates or {path: source}
         modules = [name.removesuffix(".py").replace("/", ".") for name in updates]
         try:
@@ -370,11 +396,11 @@ class ImportCheck:
 
 
 class Selector:
-    def __init__(self, mapping, tests, import_check=None):
+    def __init__(self, mapping, tests, import_check=None, *, source_base=None):
         self.mapping = mapping
         self.import_check = import_check
         self.import_environment = (
-            None if import_check is not None else ImportCheck(mapping.get("sources", {}))
+            None if import_check is not None else ImportCheck(mapping.get("sources", {}), source_base)
         )
         self.tests = tests
         self.all = {t["number"] for t in tests}
@@ -843,7 +869,7 @@ def main():
     behavior = LazyBehavior(args.behavior) if args.behavior.is_file() else None
     if behavior:
         mapping["local_behavior"] = behavior
-    selector = Selector(mapping, tests)
+    selector = Selector(mapping, tests, source_base=args.source)
     from dispatchcheck import load_profile as load_dispatch
     verifier = None if args.static else Verifier(args.source, profile, tests, selector.schedule,
                                                queries=args.queries if args.query_checks else None,

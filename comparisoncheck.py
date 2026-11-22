@@ -135,7 +135,12 @@ def identity_equality_pair(pair):
             or (tuple(b) == none and tuple(a[:2]) == ("builtin", "builtins") and a[2] in builtin_names))
 
 
-def load_comparison_profile(path):
+def load_comparison_profile(path, *, use_cache=True):
+    if use_cache:
+        from profilecache import load
+        cached = load(path, 'comparisons')
+        if cached is not None:
+            return cached
     try:
         with gzip.open(path, "rt") as stream:
             profile = json.load(stream)

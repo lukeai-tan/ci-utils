@@ -35,6 +35,7 @@ output*.jsonl
 !/tools/build_dispatch_profile.py
 /maps/import-state.json.gz
 /maps/stages.pkl.xz
+/maps/*.validated.pkl
 
 # Private research must never be included by normal staging.
 **/public-research*

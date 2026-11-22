@@ -16,6 +16,7 @@
 !stagecheck.py
 !dispatchcheck.py
 !warmcheck.py
+!profilecache.py
 !maps/
 !maps/baseline.json.gz
 !maps/runtime.json.gz
