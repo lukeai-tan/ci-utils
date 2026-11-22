@@ -809,6 +809,7 @@ def main():
     parser.add_argument('--aggressive-min-cpu', type=float, choices=(0.5, 1.0, 2.0, 4.0), default=4.0)
     parser.add_argument('--aggressive-broad', action='store_true')
     parser.add_argument('--aggressive-small-groups', action='store_true')
+    parser.add_argument('--verified-medium-groups', action='store_true')
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -861,6 +862,7 @@ def main():
                                                aggressive_min_cpu=args.aggressive_min_cpu,
                                                aggressive_broad=args.aggressive_broad,
                                                aggressive_small_groups=args.aggressive_small_groups,
+                                               verified_medium_groups=args.verified_medium_groups,
                                                compiled=compiled)
     try:
         for path in sorted((args.data / "commits").glob("*.patch")):

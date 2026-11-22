@@ -355,7 +355,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None, sta
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, aggressive_min_cpu=4.0, aggressive_broad=False, aggressive_small_groups=False, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, aggressive_min_cpu=4.0, aggressive_broad=False, aggressive_small_groups=False, verified_medium_groups=False, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -382,6 +382,8 @@ class Verifier:
         self.aggressive_broad = aggressive_broad
         self.aggressive_small_groups = aggressive_small_groups
         self.small_group_cpu = 0.0
+        self.verified_medium_groups = verified_medium_groups
+        self.medium_group_cpu = 0.0
         self.aggressive_cpu = 0.0
         self.aggressive_attempted = set()
         self.fixture_delta = fixture_delta
@@ -789,6 +791,8 @@ class Verifier:
         if not cheap or saving < 4:
             return self.small_group_refine(patch, selected, protected=protected)
         budget = min(2.5, saving * .35, self.cpu_budget - self.used_cpu, 20 - self.aggressive_cpu)
+        if self.medium_group_cpu and budget < 2.5:
+            return selected, []  # Extra verification must not weaken an existing speculative probe.
         if budget < 1.5:
             return self.small_group_refine(patch, selected, protected=protected)
         # Include class setup/teardown when choosing up to eight cheap probes.
@@ -813,6 +817,8 @@ class Verifier:
             self.start()
             budget = min(budget, self.cpu_budget - self.used_cpu,
                          20 - self.aggressive_cpu - (self.used_cpu - started))
+            if self.medium_group_cpu and budget < 2.5:
+                return selected, []
             if budget <= 0:
                 return selected, []
             names = [self.tests[n]['id'] for n in candidates]
@@ -847,31 +853,41 @@ class Verifier:
 
     def small_group_refine(self, patch, selected, *, protected=()):
         """Verify an affordable whole group; remove only reported passes."""
-        if (not self.aggressive_small_groups or self.small_group_cpu >= 4
-                or self.disabled or not self.timing or self.used_cpu >= self.cpu_budget
-                or time.monotonic() >= self.deadline):
+        if (not self.aggressive_small_groups or self.disabled or not self.timing
+                or self.used_cpu >= self.cpu_budget or time.monotonic() >= self.deadline):
             return selected, []
         worker = self.process if self.process is not None and not self.warm_mode else self.processes.get(False)
         if worker is None or worker.poll() is not None:
             return selected, []  # Starting a worker can cost more than a small group saves.
         prices = self.timing['cpu']
         candidates = {n for n in selected - set(protected) if self.tests[n]['id'] in prices}
-        if (not candidates or len(candidates) > 32
-                or any(prices[self.tests[n]['id']] > .5 for n in candidates)):
+        if not candidates or len(candidates) > 32:
             return selected, []
         saving = self.cost(selected) - self.cost(selected - candidates)
-        budget = min(2.5, saving * .8, 4 - self.small_group_cpu, self.cpu_budget - self.used_cpu)
         owners = {self.tests[n]['id'].rsplit('::', 1)[0] for n in candidates}
-        estimate = 1.0 + sum(max(.002, prices[self.tests[n]['id']]) for n in candidates)
-        estimate += sum(self.timing['setup'].get(owner, 0) + self.timing['teardown'].get(owner, 0)
-                        for owner in owners)
-        if saving < 2 or budget < 1.5 or estimate >= budget:
+        methods = sum(max(.002, prices[self.tests[n]['id']]) for n in candidates)
+        fixtures = sum(self.timing['setup'].get(owner, 0) + self.timing['teardown'].get(owner, 0)
+                       for owner in owners)
+        # Keep the established plan first. The additional plan verifies the
+        # entire requested group and never authorizes speculative omission.
+        plans = [('small_group_cpu', 4.0, .5, 2.5, 1.0, 2.0, 1.5)]
+        if self.verified_medium_groups:
+            plans.append(('medium_group_cpu', 6.0, 1.0, 3.5,
+                          max(1.5, self.progressive_overhead), 3.0, 2.5))
+        for counter, limit, max_cpu, request_cap, overhead, min_saving, min_budget in plans:
+            spent = getattr(self, counter)
+            budget = min(request_cap, saving * .8, limit - spent, self.cpu_budget - self.used_cpu)
+            if (spent < limit and all(prices[self.tests[n]['id']] <= max_cpu for n in candidates)
+                    and saving >= min_saving and budget >= min_budget
+                    and overhead + methods + fixtures < budget):
+                break
+        else:
             return selected, []
         started = self.used_cpu
         try:
             self.start()
             budget = min(budget, self.cpu_budget - self.used_cpu,
-                         4 - self.small_group_cpu - (self.used_cpu - started))
+                         limit - getattr(self, counter) - (self.used_cpu - started))
             if budget <= 0:
                 return selected, []
             ordered = sorted(candidates, key=lambda n: (prices[self.tests[n]['id']], n))
@@ -882,15 +898,18 @@ class Verifier:
             self.aggressive_attempted.update(candidates)
             result = self.read(min(12, max(.1, self.deadline - time.monotonic())))
             self.used_cpu += result['cpu']
-            passed = {self.by_id[name] for name in result.get('passed', []) if name in self.by_id} & candidates
-            return selected - passed, [f'verified {len(passed)} of {len(candidates)} affordable group tests']
+            passing_names = (set(result.get('passed', [])) - set(result.get('failed', []))
+                             - set(result.get('incomplete', [])))
+            passed = {self.by_id[name] for name in passing_names if name in self.by_id} & candidates
+            kind = 'medium' if counter == 'medium_group_cpu' else 'affordable'
+            return selected - passed, [f'verified {len(passed)} of {len(candidates)} {kind} group tests']
         except (OSError, ValueError, KeyError, TypeError, EOFError, TimeoutError):
             self.close()
             self.used_cpu += budget
-            self.small_group_cpu = 4  # Disable this extension without disabling broad probes.
+            setattr(self, counter, limit)  # Disable only the unsuccessful plan.
             return selected, ['small group verification unavailable; retained candidates']
         finally:
-            self.small_group_cpu += self.used_cpu - started
+            setattr(self, counter, getattr(self, counter) + self.used_cpu - started)
 
     def refine(self, patch, selected, *, data_readers=(), mixed=False):
         if (self.disabled or not selected
