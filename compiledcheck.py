@@ -53,6 +53,12 @@ def children(code):
     return [value for value in code.co_consts if isinstance(value, CodeType)]
 
 
+def complete_scope_lines(profile, path, key):
+    """Cold collection covers absent lines only for a known pristine scope."""
+    return (profile.get('unseen_scopes') is True
+            and key in profile.get('universe', {}).get(path, []))
+
+
 def changes(old, new):
     """Match nested bodies independently; changed closures still affect their owner."""
     before, after = children(old), children(new)
@@ -130,17 +136,19 @@ def query_reachability(profile, base, patch):
         for before, after in pairs:
             if not before.co_flags & 1:
                 return None
-            row = profile['codes'].get(edit.path, {}).get(identity(before))
+            key = identity(before)
+            row = profile['codes'].get(edit.path, {}).get(key)
             if (row is None and profile.get('unseen_scopes')
                     and identity(before) in profile.get('universe', {}).get(edit.path, [])):
                 continue
             if row is None or row['query_outside']:
                 return None
-            lines = profile.get('query_lines', {}).get(edit.path, {}).get(identity(before))
+            lines = profile.get('query_lines', {}).get(edit.path, {}).get(key)
             if lines:
                 from statementcheck import locations
                 spans = locations(*trees, before, after)
-                if spans and all(any(start <= int(n) <= end for n in lines) for start, end in spans):
+                if spans and (complete_scope_lines(profile, edit.path, key)
+                              or all(any(start <= int(n) <= end for n in lines) for start, end in spans)):
                     mask = 0
                     for start, end in spans:
                         for n, value in lines.items():
@@ -189,25 +197,30 @@ def consumers(profile, path, original, updated, *, trees=None, statements=True):
         for before, after in pairs:
             if not before.co_flags & 1:
                 return None
-            row = entries.get(identity(before))
+            key = identity(before)
+            row = entries.get(key)
             if (row is None and profile.get('unseen_scopes')
                     and identity(before) in profile.get('universe', {}).get(path, [])):
                 continue
             if row is None or row['startup']:
                 return None
+            complete_lines = complete_scope_lines(profile, path, key)
             locations = constant_locations(before, after) if before.co_flags & 1 else None
             if locations is None and statements:
                 spans = statement_locations(*trees, before, after)
-                if spans and all(any(str(n) in row['lines'] for n in range(start, end + 1))
-                                 for start, end in spans):
+                if spans and (complete_lines or all(any(str(n) in row['lines'] for n in range(start, end + 1))
+                                                   for start, end in spans)):
                     locations = {n for start, end in spans for n in range(start, end + 1)
                                  if str(n) in row['lines']}
             # Captured values are consumed after the outer call. Frame entry is
             # the fallback whenever a changed function creates closure cells.
-            if locations and not before.co_cellvars and all(str(n) in row['lines'] for n in locations):
+            if (locations is not None and not before.co_cellvars
+                    and (complete_lines or locations and all(str(n) in row['lines'] for n in locations))):
+                # Full cold traces can prove that an executable statement was
+                # never reached. Partial profiles keep the whole-frame bound.
                 selected |= int(row.get('extra', '0'), 16)
                 for line in locations:
-                    selected |= int(row['lines'][str(line)], 16)
+                    selected |= int(row['lines'].get(str(line), '0'), 16)
             else:
                 selected |= int(row['tests'], 16)
         return selected | int(profile['incomplete'], 16)

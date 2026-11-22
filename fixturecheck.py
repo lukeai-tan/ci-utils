@@ -376,7 +376,7 @@ def plan(profile, base, patch, names, *, allow_delta=True):
                         if start <= int(line) <= end:
                             observed = True
                             affected.update(case_numbers(row, cases))
-                    if not observed:
+                    if not observed and key not in profile['universe'].get(path, []):
                         affected.update(case_numbers(row, entry['cases']))
             else:
                 affected.update(case_numbers(row, entry['cases']))
