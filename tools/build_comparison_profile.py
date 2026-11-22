@@ -16,6 +16,7 @@ import importlib.machinery
 import json
 import operator
 import os
+import pickle
 import resource
 import sys
 import tempfile
@@ -23,10 +24,12 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from comparisoncheck import COMPARISONS, REVISION, identity_equality_pair, location, operand_types, source_hash
 
 
 OPERATORS = {"Eq": operator.eq, "NotEq": operator.ne, "Is": operator.is_, "IsNot": operator.is_not}
+ACTIVE = None
 
 
 def cpu_seconds():
@@ -69,6 +72,41 @@ def compile_profile(data):
     return profile
 
 
+def compact_certificates(profile):
+    """Store the same certified baseline contexts as bounded bit sets."""
+    if profile['version'] != 3:
+        raise ValueError('compiled comparison profile required')
+    return dict(profile, version=4, certified={
+        key: format(sum(1 << i for i in set(contexts)), 'x')
+        for key, contexts in profile['certified'].items()})
+
+
+def merge_certificates(baseline, measured, selected):
+    """Replace measured contexts, including failed or missing worker evidence."""
+    if (baseline['version'] not in (3, 4) or measured['version'] not in (3, 4)
+            or baseline['revision'] != measured['revision'] or baseline['tests'] != measured['tests']
+            or baseline['kind'] != measured['kind'] or not baseline['collection_complete']
+            or not measured['collection_complete']
+            or any(baseline['sources'].get(path) != value for path, value in measured['sources'].items())):
+        raise ValueError('incompatible comparison measurements')
+    selected = {baseline['tests'].index(name) for name in selected}
+    if not set(measured['complete']) <= selected:
+        raise ValueError('unexpected measured context')
+    def contexts(profile, key):
+        value = profile['certified'].get(key, [] if profile['version'] == 3 else '0')
+        if profile['version'] == 3:
+            return set(value)
+        bits = int(value, 16)
+        return {i for i in profile['complete'] if bits & (1 << i)}
+    certified = {key: sorted((contexts(baseline, key) - selected) | contexts(measured, key))
+                 for key in baseline['certified'].keys() | measured['certified'].keys()}
+    complete = (set(baseline['complete']) - selected) | set(measured['complete'])
+    cpu = dict(baseline['cpu'])
+    cpu.update(measured['cpu'])
+    bad = (set(baseline.get('bad', [])) - {str(i) for i in selected}) | set(measured.get('bad', []))
+    return dict(baseline, version=3, certified=certified, complete=sorted(complete), cpu=cpu, bad=sorted(bad))
+
+
 class Recorder:
     def __init__(self, root, catalog=(), directory=None, context="startup"):
         self.root = Path(root).resolve()
@@ -86,6 +124,12 @@ class Recorder:
         self.collection_complete = False
         self.started = 0
 
+    def contexts(self, context):
+        if context.startswith('class:'):
+            owner = context.removeprefix('class:')
+            return [str(i) for i, name in enumerate(self.tests) if name.rsplit('::', 1)[0] == owner]
+        return [context]
+
     def comparison(self, key, op, left, right):
         self.operands[key][self.current].add(operand_types(left, right))
         return OPERATORS[op](left, right)
@@ -102,8 +146,23 @@ class Recorder:
             self.sources[path] = digest
         for key, contexts in data["operands"].items():
             for context, pairs in contexts.items():
-                self.operands[key][context].update(tuple(tuple(value) for value in pair) for pair in pairs)
-        self.bad.update(data.get("bad", []))
+                for index in self.contexts(context):
+                    self.operands[key][index].update(tuple(tuple(value) for value in pair) for pair in pairs)
+        for context in data.get('bad', []):
+            self.bad.update(self.contexts(context))
+
+    def finish_children(self):
+        """Wait until class cleanup has joined every persistent worker."""
+        for context, children in self.expected_children.items():
+            for pid in children:
+                try:
+                    data = json.loads((self.directory / f'end-{pid}.json').read_text())
+                    if data['context'] != context or not data['finished']:
+                        raise ValueError('unfinished child')
+                    self.merge(data)
+                except (OSError, ValueError, KeyError, TypeError):
+                    self.bad.update(self.contexts(context))
+        self.complete.difference_update([i for i in self.complete if str(i) in self.bad])
 
     def data(self):
         return dict(revision=REVISION, version=1, kind="comparison_types", tests=self.tests,
@@ -130,14 +189,6 @@ class Recorder:
     def pytest_runtest_logfinish(self, nodeid, location):
         index = self.by_id[nodeid]
         context = str(index)
-        for pid in self.expected_children[context]:
-            try:
-                data = json.loads((self.directory / f"end-{pid}.json").read_text())
-                if data["context"] != context or not data["finished"]:
-                    raise ValueError("unfinished child")
-                self.merge(data)
-            except (OSError, ValueError, KeyError, TypeError):
-                self.bad.add(context)
         self.cpu[nodeid] = round(cpu_seconds() - self.started, 6)
         if context not in self.bad and self.phases[context] == {"setup", "call", "teardown"}:
             self.complete.add(index)
@@ -200,6 +251,7 @@ def install(recorder):
 
 def child_bootstrap():
     """sitecustomize installs measurement before spawn unpickles source objects."""
+    global ACTIVE
     arguments = getattr(sys, "orig_argv", sys.argv)
     if any("from multiprocessing.resource_tracker import main" in value for value in arguments):
         return
@@ -207,6 +259,7 @@ def child_bootstrap():
     directory = Path(os.environ["CI_COMPARE_OUTPUT"])
     context = os.environ["CI_COMPARE_CONTEXT"]
     recorder = Recorder(root, directory=directory, context=context)
+    ACTIVE = recorder
     install(recorder)
     (directory / f"start-{os.getpid()}.json").write_text(json.dumps({"context": context}))
 
@@ -218,6 +271,49 @@ def child_bootstrap():
     atexit.register(save)
 
 
+def measured_task(context, payload):
+    """Attribute actual spawned tasks without reusing the first worker context."""
+    if ACTIVE is None:
+        raise ValueError('comparison worker was not instrumented')
+    previous = ACTIVE.current
+    try:
+        # Imports and input restoration can feed later tasks in this pool.
+        function, args, kwargs = pickle.loads(payload)
+        ACTIVE.current = context
+        return function(*args, **kwargs)
+    finally:
+        ACTIVE.current = previous
+
+
+def measured_pool(original_pool, recorder):
+    class MeasuredPool(original_pool):
+        def __init__(self, *args, **kwargs):
+            context = recorder.current
+            self.comparison_context = ('class:' + recorder.tests[int(context)].rsplit('::', 1)[0]
+                                       if context != 'startup' else context)
+            super().__init__(*args, **kwargs)
+
+        def _spawn_process(self):
+            previous = os.environ['CI_COMPARE_CONTEXT']
+            os.environ['CI_COMPARE_CONTEXT'] = self.comparison_context
+            try:
+                result = super()._spawn_process()
+                recorder.expected_children[self.comparison_context].update(self._processes or {})
+                return result
+            finally:
+                os.environ['CI_COMPARE_CONTEXT'] = previous
+
+        def submit(self, function, /, *args, **kwargs):
+            from build_comparison_profile import measured_task as worker_task
+            return super().submit(worker_task, recorder.current,
+                                  pickle.dumps((function, args, kwargs), protocol=5))
+
+        def shutdown(self, *args, **kwargs):
+            recorder.expected_children[self.comparison_context].update(self._processes or {})
+            return super().shutdown(*args, **kwargs)
+    return MeasuredPool
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
@@ -226,9 +322,11 @@ def main():
     parser.add_argument("--baseline-map", type=Path, default=Path(__file__).resolve().parents[1] / "maps/baseline.json.gz")
     parser.add_argument("--only", nargs="*")
     parser.add_argument("--exclude", nargs="*", default=[])
+    parser.add_argument('--merge', type=Path)
     args = parser.parse_args()
     root = args.source.resolve()
     output = args.out.resolve()
+    merge_path = args.merge.resolve() if args.merge is not None else None
     catalog = json.loads(args.tests.resolve().read_text())["tests"]
     with gzip.open(args.baseline_map.resolve(), "rt") as stream:
         baseline = json.load(stream)
@@ -256,19 +354,22 @@ def main():
         install(recorder)
         original_pool = concurrent.futures.ProcessPoolExecutor
 
-        class MeasuredPool(original_pool):
-            def __exit__(self, *args):
-                context = recorder.current
-                recorder.expected_children[context].update(self._processes or {})
-                return super().__exit__(*args)
-
-        concurrent.futures.ProcessPoolExecutor = MeasuredPool
+        concurrent.futures.ProcessPoolExecutor = measured_pool(original_pool, recorder)
         import pytest
         result = pytest.main([*selected, "-q", "--maxfail=1", "-p", "no:cacheprovider",
                               "-p", "pytest_timeout", "--timeout=300"], plugins=[recorder]) if selected else 0
+        recorder.finish_children()
+        profile = compile_profile(recorder.data())
+        if merge_path is not None:
+            from comparisoncheck import load_comparison_profile
+            baseline_profile = load_comparison_profile(merge_path)
+            if baseline_profile is None:
+                raise ValueError('invalid comparison merge baseline')
+            profile = merge_certificates(baseline_profile, profile, selected)
         output.parent.mkdir(parents=True, exist_ok=True)
         with gzip.GzipFile(filename=str(output), mode="wb", mtime=0) as stream:
-            stream.write(json.dumps(compile_profile(recorder.data()), separators=(",", ":"), sort_keys=True).encode())
+            stream.write(json.dumps(compact_certificates(profile),
+                                    separators=(",", ":"), sort_keys=True).encode())
         print("Comparison types", len(recorder.operands), "complete", len(recorder.complete),
               "of", len(catalog), "bad", len(recorder.bad), file=sys.stderr)
         raise SystemExit(result)

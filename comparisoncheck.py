@@ -139,7 +139,7 @@ def load_comparison_profile(path):
     try:
         with gzip.open(path, "rt") as stream:
             profile = json.load(stream)
-        if (profile["revision"] != REVISION or profile["version"] not in (1, 2, 3)
+        if (profile["revision"] != REVISION or profile["version"] not in (1, 2, 3, 4)
                 or profile["kind"] != "comparison_types" or not profile["collection_complete"]
                 or "startup" in profile.get("bad", [])
                 or not isinstance(profile["sources"], dict)
@@ -149,6 +149,14 @@ def load_comparison_profile(path):
         if (not complete <= set(range(len(profile["tests"])))
                 or not all(profile["tests"][i] in profile["cpu"] for i in complete)):
             return None
+        if profile['version'] == 4:
+            limit = sum(1 << i for i in complete)
+            if (not isinstance(profile['certified'], dict)
+                    or any(type(key) is not str or type(bits) is not str
+                           or int(bits, 16) < 0 or int(bits, 16) & ~limit
+                           for key, bits in profile['certified'].items())):
+                return None
+            return profile
         if profile["version"] == 3:
             # The offline builder applies the same type proof once for every
             # baseline source location. No edit or alternative result is used.
@@ -209,10 +217,13 @@ def certified_tests(profile, updates, originals, catalog, *, trees=None):
         return set()
     safe_contexts = set(profile["complete"])
     for key in changes:
-        if profile["version"] == 3:
+        if profile["version"] in (3, 4):
             contexts = profile["certified"].get(key)
             if not contexts:
                 return set()
+            if profile['version'] == 4:
+                mask = int(contexts, 16)
+                contexts = [i for i in safe_contexts if mask & (1 << i)]
             safe_contexts.intersection_update(contexts)
             continue
         contexts = profile["operands"].get(key)
