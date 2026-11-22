@@ -805,6 +805,7 @@ def main():
     parser.add_argument('--import-verification', action='store_true')
     parser.add_argument('--no-warm-verification', action='store_true')
     parser.add_argument('--warm-verification', action='store_true')
+    parser.add_argument('--aggressive', action='store_true')
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -853,6 +854,7 @@ def main():
                                                warm=mapping.get('startup') if args.warm_verification and not args.no_warm_verification else None,
                                                fixture_delta=not args.no_fixture_delta,
                                                progressive=not args.no_progressive_verification,
+                                               aggressive=args.aggressive,
                                                compiled=compiled)
     try:
         for path in sorted((args.data / "commits").glob("*.patch")):
@@ -886,6 +888,8 @@ def main():
                 chosen, checked = verifier.import_refine(patch, chosen, protected=protected)
                 reasons.extend(checked)
                 chosen, checked = verifier.stage_refine(patch, chosen, protected=protected)
+                reasons.extend(checked)
+                chosen, checked = verifier.aggressive_refine(patch, chosen, protected=protected)
                 reasons.extend(checked)
                 chosen, checked = verifier.task_query_refine(patch, chosen, protected=protected, planning_patch=code_patch)
                 reasons.extend(checked)

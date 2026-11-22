@@ -1,4 +1,4 @@
-"""Bounded verification on the real patched source; uncertainty retains tests."""
+"""Bounded verification with optional speculative selection after clean probes."""
 
 from __future__ import annotations
 
@@ -167,10 +167,13 @@ class Verdicts:
     def __init__(self):
         self.phases = {}
         self.bad = set()
+        self.failed = set()
 
     def pytest_runtest_logreport(self, report):
         if report.failed or report.skipped:
             self.bad.add(report.nodeid)
+        if report.failed:
+            self.failed.add(report.nodeid)
         if report.passed:
             self.phases.setdefault(report.nodeid, set()).add(report.when)
 
@@ -202,12 +205,16 @@ def run_tests(root, names, cpu_limit, *, fixtures=None, fixture_plans=None):
     signal.signal(signal.SIGPROF, timed_out)
     signal.setitimer(signal.ITIMER_PROF, cpu_limit)
     try:
-        pytest.main([*names, "-q", "--maxfail=1", "--import-mode=importlib", "--rootdir=" + str(root),
+        status = pytest.main([*names, "-q", "--maxfail=1", "--import-mode=importlib", "--rootdir=" + str(root),
                      "-p", "no:cacheprovider", "-p", "pytest_timeout",
                      "--timeout=" + str(max(5, min(15, cpu_limit)))], plugins=plugins)
     finally:
         signal.setitimer(signal.ITIMER_PROF, 0)
-    return {"passed": [name for name in verdicts.passed() if case_filter is None or case_filter.complete(name)]}
+    passed = [name for name in verdicts.passed() if case_filter is None or case_filter.complete(name)]
+    failed = sorted(verdicts.failed & set(names))
+    return {"passed": passed, "failed": failed,
+            "incomplete": sorted(set(names) - set(passed) - set(failed)),
+            "completed": status == 0 and set(passed) == set(names)}
 
 
 def cpu_seconds():
@@ -348,7 +355,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None, sta
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -370,6 +377,9 @@ class Verifier:
         # then raise this estimate from completed verification requests.
         self.progressive_overhead = 1.5
         self.progressive = progressive
+        self.aggressive = aggressive
+        self.aggressive_cpu = 0.0
+        self.aggressive_attempted = set()
         self.fixture_delta = fixture_delta
         self.queries = Path(queries) if queries is not None else None
         self.query_backend_files = None
@@ -741,6 +751,90 @@ class Verifier:
             self.disabled = True
             return selected, ["query verification unavailable; retained candidates"]
 
+    def aggressive_refine(self, patch, selected, *, protected=()):
+        """Speculate about unrun expensive tests only after a completed clean probe.
+
+        Passing a sample does not certify the omitted tests. This separate,
+        opt-in policy trades that risk against their simulated schedule cost.
+        Actual failures, skips, missing reports and errors block speculation.
+        """
+        self.aggressive_attempted = set()
+        if (not self.aggressive or self.disabled or not self.timing
+                or self.aggressive_cpu >= 20 or self.used_cpu >= self.cpu_budget
+                or time.monotonic() >= self.deadline):
+            return selected, []
+        from selector import parse_patch
+        try:
+            edits = parse_patch(patch)
+            if (not edits or len({e.path for e in edits}) != len(edits)
+                    or not any(e.path.startswith('sqlglot/') and e.path.endswith('.py') for e in edits)
+                    or any(not (self.base / e.path).is_file() for e in edits)):
+                return selected, []
+        except (ValueError, OSError):
+            return selected, []
+        eligible = selected - set(protected)
+        prices = self.timing['cpu']
+        expensive = {n for n in eligible if prices.get(self.tests[n]['id'], 0) >= 4.0}
+        if not expensive:
+            return selected, []
+        saving = self.cost(selected) - self.cost(selected - expensive)
+        cheap = sorted((n for n in eligible - expensive
+                        if self.tests[n]['id'] in prices and prices[self.tests[n]['id']] <= .35),
+                       key=lambda n: (prices[self.tests[n]['id']], n))
+        if not cheap or saving < 4:
+            return selected, []
+        budget = min(2.5, saving * .35, self.cpu_budget - self.used_cpu, 20 - self.aggressive_cpu)
+        if budget < 1.5:
+            return selected, []
+        # Include class setup/teardown when choosing up to eight cheap probes.
+        # One costly class should not prevent affordable evidence elsewhere.
+        candidates, owners, estimate = [], set(), 1.0
+        for number in cheap:
+            owner = self.tests[number]['id'].rsplit('::', 1)[0]
+            price = max(.002, prices[self.tests[number]['id']])
+            if owner not in owners:
+                price += self.timing['setup'].get(owner, 0) + self.timing['teardown'].get(owner, 0)
+            if estimate + price >= budget:
+                continue
+            candidates.append(number)
+            owners.add(owner)
+            estimate += price
+            if len(candidates) == 8:
+                break
+        if not candidates:
+            return selected, []
+        started = self.used_cpu
+        try:
+            self.start()
+            budget = min(budget, self.cpu_budget - self.used_cpu,
+                         20 - self.aggressive_cpu - (self.used_cpu - started))
+            if budget <= 0:
+                return selected, []
+            names = [self.tests[n]['id'] for n in candidates]
+            request = dict(patch=patch, tests=names, cpu_limit=budget,
+                           wall_limit=min(10, max(.1, self.deadline - time.monotonic())))
+            self.process.stdin.write(json.dumps(request, separators=(',', ':')) + '\n')
+            self.process.stdin.flush()
+            self.aggressive_attempted = set(candidates)
+            result = self.read(min(12, max(.1, self.deadline - time.monotonic())))
+            self.used_cpu += result['cpu']
+            passed = {self.by_id[name] for name in result.get('passed', []) if name in self.by_id} & set(candidates)
+            clean = (result.get('completed') is True and not result.get('failed')
+                     and not result.get('incomplete') and 'error' not in result
+                     and set(result.get('passed', [])) == set(names))
+            if clean:
+                return selected - passed - expensive, [
+                    f'aggressive: {len(passed)} clean probes; speculatively omitted {len(expensive)} unrun expensive tests']
+            return selected - passed, [
+                f'aggressive: {len(passed)} passed, {len(result.get("failed", []))} failed; '
+                'probe failed or incomplete, retained expensive tests']
+        except (OSError, ValueError, KeyError, TypeError, EOFError, TimeoutError):
+            self.close()
+            self.aggressive_cpu = 20  # No trustworthy CPU receipt from this worker.
+            return selected, ['aggressive probe unavailable; retained candidates']
+        finally:
+            self.aggressive_cpu += self.used_cpu - started
+
     def refine(self, patch, selected, *, data_readers=(), mixed=False):
         if (self.disabled or not selected
                 or time.monotonic() >= self.deadline or self.used_cpu >= self.cpu_budget):
@@ -761,7 +855,7 @@ class Verifier:
         if fixture_plans:
             prices = dict(prices)
             prices.update({name: row['cpu'] for name, row in fixture_plans.items()})
-        attempted, notes = set(), []
+        attempted, notes = set(self.aggressive_attempted), []
         started = self.used_cpu
         for _ in range(3 if self.progressive else 1):
             if (self.disabled or self.used_cpu - started >= 12 or self.used_cpu >= self.cpu_budget
