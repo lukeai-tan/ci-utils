@@ -768,6 +768,10 @@ def main():
     parser.add_argument('--no-statement-selection', action='store_true')
     parser.add_argument('--fixture-cases', type=Path, default=Path(__file__).parent / 'maps/fixtures.json.gz')
     parser.add_argument('--no-fixture-replay', action='store_true')
+    parser.add_argument('--no-query-statements', action='store_true')
+    parser.add_argument('--no-fixture-delta', action='store_true')
+    parser.add_argument('--no-mixed-planning', action='store_true')
+    parser.add_argument('--no-progressive-verification', action='store_true')
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -782,6 +786,8 @@ def main():
     from compiledcheck import load_profile as load_compiled
     from fieldcheck import load_profile as load_fields
     compiled = load_compiled(args.compiled)
+    if compiled and args.no_query_statements:
+        compiled.pop('query_lines', None)
     fields = load_fields(args.fields)
     if compiled:
         mapping['compiled_consumers'] = compiled
@@ -806,6 +812,8 @@ def main():
                                                timing=load_timing(args.timing),
                                                task_queries=None if args.no_query_replay else args.task_queries,
                                                fixtures=None if args.no_fixture_replay else args.fixture_cases,
+                                               fixture_delta=not args.no_fixture_delta,
+                                               progressive=not args.no_progressive_verification,
                                                compiled=compiled)
     try:
         for path in sorted((args.data / "commits").glob("*.patch")):
@@ -813,16 +821,33 @@ def main():
             chosen, reasons = selector.select(patch)
             if verifier is not None:
                 protected = set(selector.unknown) | selector.translated(mapping.get("introspection", []))
+                data_readers, code_patch, mixed = set(), None, False
                 try:
-                    for edit in parse_patch(patch):
+                    edits = parse_patch(patch)
+                    mixed = (not args.no_mixed_planning and any(e.path.endswith('.py') for e in edits)
+                             and any(not e.path.endswith('.py') for e in edits))
+                    code_parts = []
+                    for edit in edits:
                         protected.update(selector.translated(mapping["reads"].get(edit.path, [])))
-                except ValueError:
+                        if not edit.path.endswith('.py'):
+                            data_readers.update(selector.translated(mapping['reads'].get(edit.path, [])) or selector.all)
+                        elif mixed:
+                            import difflib
+                            old = mapping['sources'][edit.path]
+                            new, _ = apply_edit(old, edit)
+                            code_parts.append(''.join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+                                              fromfile='a/' + edit.path, tofile='b/' + edit.path)))
+                    if mixed:
+                        code_patch = ''.join(code_parts)
+                    protected.update(data_readers)
+                except (ValueError, KeyError):
                     protected.update(selector.all)
-                chosen, checked = verifier.task_query_refine(patch, chosen, protected=protected)
+                    data_readers.update(selector.all)
+                chosen, checked = verifier.task_query_refine(patch, chosen, protected=protected, planning_patch=code_patch)
                 reasons.extend(checked)
                 chosen, checked = verifier.query_refine(patch, chosen)
                 reasons.extend(checked)
-                chosen, checked = verifier.refine(patch, chosen)
+                chosen, checked = verifier.refine(patch, chosen, data_readers=data_readers, mixed=mixed)
                 reasons.extend(checked)
             workers = selector.schedule(chosen, fill=not args.no_fill)
             print(

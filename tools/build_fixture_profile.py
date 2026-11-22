@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from compiledcheck import children, identity
 from comparisoncheck import REVISION, source_hash
-from fixturecheck import DRIVER, OWNER, digest, shared_state, prepare_worker, compact
+from fixturecheck import DRIVER, OWNER, digest, shared_state, prepare_worker, compact, fixture_inputs
 
 
 class Recorder:
@@ -141,9 +141,10 @@ def main():
         raise ValueError('pristine pinned source required')
     timing = json.load(gzip.open(repo / 'maps/timing.json.gz', 'rt'))
     tree = ast.parse((root / DRIVER).read_text())
-    methods = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.startswith('test_')
+    methods_nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.startswith('test_')
                and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == 'check_file'
                        for c in ast.walk(n))]
+    methods = [n.name for n in methods_nodes]
     names = [OWNER + '::' + method for method in methods]
     if args.only is not None:
         if not set(args.only) <= set(names):
@@ -191,7 +192,9 @@ def main():
                     row['startup'] |= observed['startup']
                     for line in observed['lines']:
                         row['lines'].setdefault(str(line), []).append(index)
+        method = next(n for n in methods_nodes if n.name == name.rsplit('::', 1)[-1])
         return name, {'tasks': tasks, 'codes': codes, 'cpu': timing['cpu'][name],
+                      'fixtures': fixture_inputs(root, method, len(tasks)),
                       'base_cpu': min(timing['cpu'][name], 0.2 + (verdict.get('parent_cpu')
                                       if verdict.get('parent_cpu') is not None else timing['cpu'][name] * 0.1))}
     tests = {}

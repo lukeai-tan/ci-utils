@@ -193,7 +193,7 @@ def run_tests(root, names, cpu_limit, *, fixtures=None, fixture_plans=None):
     try:
         pytest.main([*names, "-q", "--maxfail=1", "--import-mode=importlib", "--rootdir=" + str(root),
                      "-p", "no:cacheprovider", "-p", "pytest_timeout",
-                     "--timeout=5"], plugins=plugins)
+                     "--timeout=" + str(max(5, min(15, cpu_limit)))], plugins=plugins)
     finally:
         signal.setitimer(signal.ITIMER_PROF, 0)
     return {"passed": [name for name in verdicts.passed() if case_filter is None or case_filter.complete(name)]}
@@ -293,7 +293,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None):
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, fixture_delta=True, progressive=True, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -308,6 +308,12 @@ class Verifier:
         self.unprofitable = 0
         self.task_unprofitable = 0
         self.fixture_unprofitable = 0
+        self.progressive_unprofitable = 0
+        # Reserve cold checkout and collection separately from method work,
+        # then raise this estimate from completed verification requests.
+        self.progressive_overhead = 1.5
+        self.progressive = progressive
+        self.fixture_delta = fixture_delta
         self.queries = Path(queries) if queries is not None else None
         self.query_backend_files = None
         self.values = values
@@ -318,7 +324,7 @@ class Verifier:
         self.fixtures = Path(fixtures) if fixtures is not None else None
         self.fixture_baseline = None
         self.fixture_available = self.fixtures is not None and self.fixtures.is_file()
-        self.task_available = bool((values or behavior) and self.task_queries is not None and self.task_queries.is_file())
+        self.task_available = bool((values or behavior or compiled) and self.task_queries is not None and self.task_queries.is_file())
         if self.queries is not None and self.queries.is_file():
             from querycheck import load_baseline
             try:
@@ -371,7 +377,7 @@ class Verifier:
             )
             self.used_cpu += self.read(10)["cpu"]
 
-    def task_query_refine(self, patch, selected, *, protected=()):
+    def task_query_refine(self, patch, selected, *, protected=(), planning_patch=None):
         from queryreplay import TEST, load_profile, plan
         from selector import apply_edit, parse_patch
         from valuecheck import validated_change
@@ -385,29 +391,32 @@ class Verifier:
             return selected, []
         try:
             # Avoid decoding table states for files outside optimizer replay.
-            edits = parse_patch(patch)
-            if len(edits) != 1 or not edits[0].path.startswith("sqlglot/optimizer/"):
+            planning_patch = patch if planning_patch is None else planning_patch
+            edits = parse_patch(planning_patch)
+            if not edits or any(not e.path.startswith('sqlglot/optimizer/') for e in edits):
                 return selected, []
-            old = (self.base / edits[0].path).read_text()
-            updated, _ = apply_edit(old, edits[0])
-            change = validated_change(self.values, {edits[0].path: updated}, {edits[0].path: old})
-            if change is None and self.behavior is not None:
+            change = None
+            if len(edits) == 1:
+                old = (self.base / edits[0].path).read_text()
+                updated, _ = apply_edit(old, edits[0])
+                change = validated_change(self.values, {edits[0].path: updated}, {edits[0].path: old})
+            if len(edits) == 1 and change is None and self.behavior is not None:
                 from behaviorcheck import validated_change as behavior_change
                 change = behavior_change(self.behavior, {edits[0].path: updated}, {edits[0].path: old})
             if change is None and self.compiled is None:
                 return selected, []
             if change is None and self.compiled is not None:
                 from compiledcheck import query_reachability
-                if query_reachability(self.compiled, self.base, patch) is None:
+                if query_reachability(self.compiled, self.base, planning_patch) is None:
                     return selected, []
             if self.task_baseline is None:
                 self.task_baseline = load_profile(self.task_queries)
                 self.close()  # A previously started worker did not load task data.
-            request_plan = plan(self.base, patch, self.values, self.task_baseline, self.behavior) if change else None
+            request_plan = plan(self.base, planning_patch, self.values, self.task_baseline, self.behavior) if change else None
             checkpoints = {}
             if self.compiled is not None:
                 from compiledcheck import query_plan
-                compiled_plan = query_plan(self.compiled, self.base, patch, self.task_baseline)
+                compiled_plan = query_plan(self.compiled, self.base, planning_patch, self.task_baseline)
                 if compiled_plan is not None:
                     reachable, estimate, available = compiled_plan
                     if request_plan is None:
@@ -478,42 +487,78 @@ class Verifier:
             self.disabled = True
             return selected, ["query verification unavailable; retained candidates"]
 
-    def refine(self, patch, selected):
-        if (self.disabled or self.unprofitable >= 2 or not selected
+    def refine(self, patch, selected, *, data_readers=(), mixed=False):
+        if (self.disabled or not selected
                 or time.monotonic() >= self.deadline or self.used_cpu >= self.cpu_budget):
             return selected, []
         prices = self.timing["cpu"] if self.timing else self.profile.get("cpu", {})
         fixture_plans = {}
-        if (self.fixture_available and self.fixture_unprofitable < 2 and 'sqlglot/optimizer/' in patch
+        if (self.fixture_available and self.fixture_unprofitable < 2
+                and ('sqlglot/optimizer/' in patch or (self.fixture_delta and 'tests/fixtures/optimizer/' in patch))
                 and any(self.tests[n]['id'].startswith('tests/test_optimizer.py::TestOptimizer::') for n in selected)):
             from fixturecheck import load_profile, plan
             try:
                 if self.fixture_baseline is None:
                     self.fixture_baseline = load_profile(self.fixtures)
                 fixture_plans = plan(self.fixture_baseline, self.base, patch,
-                                     [self.tests[n]['id'] for n in selected])
+                                     [self.tests[n]['id'] for n in selected], allow_delta=self.fixture_delta)
             except (OSError, ValueError, KeyError, TypeError, SyntaxError, RecursionError):
                 fixture_plans = {}
         if fixture_plans:
             prices = dict(prices)
             prices.update({name: row['cpu'] for name, row in fixture_plans.items()})
+        attempted, notes = set(), []
+        started = self.used_cpu
+        for _ in range(3 if self.progressive else 1):
+            if (self.disabled or self.used_cpu - started >= 12 or self.used_cpu >= self.cpu_budget
+                    or time.monotonic() >= self.deadline):
+                break
+            eligible = selected - attempted
+            if mixed:
+                eligible -= {n for n in data_readers if self.tests[n]['id'] not in fixture_plans}
+            self.last_probe = set()
+            selected, checked = self._probe(patch, selected, eligible, prices, fixture_plans)
+            notes.extend(checked)
+            if not self.last_probe:
+                break
+            attempted.update(self.last_probe)
+        return selected, notes
+
+    def _probe(self, patch, selected, eligible, prices, fixture_plans):
         # Simulated duration does not predict verification CPU. Use measured
         # real method and fixture costs, and retain anything not completed.
-        candidates = {n for n in selected if self.tests[n]["id"] in prices
+        candidates = {n for n in eligible if self.tests[n]["id"] in prices
                       and prices[self.tests[n]["id"]] <= 4.0}
+        expanded = {n for n in eligible if self.tests[n]['id'] in prices
+                    and prices[self.tests[n]['id']] <= 10.0}
+        progressive = False
         if self.timing:
             # A large bundle's whole saving requires many tests to pass. Price
             # smaller critical bundles as well; unrun tests are always retained.
             ranked = sorted(candidates, key=lambda n: (-self.tests[n]["seconds"], prices[self.tests[n]["id"]], n))
-            bundles = [candidates] + [{n} for n in ranked[:8]]
-            bundles += [set(ranked[:count]) for count in (2, 4, 8) if len(ranked) > count]
+            bundles = [(candidates, False)] + [({n}, False) for n in ranked[:8]]
+            bundles += [(set(ranked[:count]), False) for count in (2, 4, 8) if len(ranked) > count]
+            if self.progressive and self.progressive_unprofitable < 2:
+                cheapest = sorted(expanded, key=lambda n: (prices[self.tests[n]['id']], n))
+                counts = {*range(1, min(16, len(cheapest)) + 1), 32, 64, len(cheapest)}
+                bundles += [(set(cheapest[:count]), True) for count in sorted(counts)
+                            if 0 < count <= len(cheapest)]
             choices = []
             current_cost = self.cost(selected)
-            for bundle in bundles:
+            seen = set()
+            for bundle, broader in bundles:
                 if not bundle:
                     continue
+                signature = (frozenset(bundle), broader)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                has_fixtures = any(self.tests[n]['id'] in fixture_plans for n in bundle)
+                if not broader and self.unprofitable >= 2 and not has_fixtures:
+                    continue
                 owners = {self.tests[n]["id"].rsplit("::", 1)[0] for n in bundle}
-                estimate = 1.0 + sum(max(0.002, prices[self.tests[n]["id"]]) for n in bundle)
+                estimate = (self.progressive_overhead if broader else 1.0) + sum(
+                    max(0.002, prices[self.tests[n]["id"]]) for n in bundle)
                 for owner in owners:
                     teardown = self.timing['teardown'].get(owner, 0)
                     methods = [self.tests[n]['id'] for n in bundle
@@ -528,31 +573,61 @@ class Verifier:
                         teardown = min(teardown, 0.25 + teardown * share)
                     estimate += self.timing['setup'].get(owner, 0) + teardown
                 saving = current_cost - self.cost(selected - bundle)
-                expected = saving * 0.7 ** min(len(bundle), 4) - estimate
-                if expected > 0.1:
-                    choices.append((expected, saving, estimate, bundle))
+                # The broader policy treats failure as a property of the edit;
+                # the probability only steers probes, never certifies a pass.
+                probability = 0.7 if broader else 0.7 ** min(len(bundle), 4)
+                deltas = [fixture_plans.get(self.tests[n]['id'], {}) for n in bundle]
+                if any(p.get('fixture_delta') for p in deltas):
+                    probability = (1.0 if all(p.get('fixture_delta') and not p['indices'] for p in deltas)
+                                   else min(probability, 0.5))
+                expected = saving * probability - estimate
+                if expected > 0.1 and estimate < min(12.0, self.cpu_budget - self.used_cpu):
+                    choices.append((expected, saving, estimate, bundle, broader))
             if not choices:
                 return selected, []
-            _, possible_saving, estimate, candidates = max(choices, key=lambda choice: (choice[0], -len(choice[3])))
+            # Keep useful established probes ahead of exploratory groups. Their
+            # failure counters are independent, so exploration cannot suppress
+            # later established probes after two unprofitable results.
+            established = [choice for choice in choices if not choice[4]]
+            _, possible_saving, estimate, candidates, progressive = max(established or choices,
+                key=lambda choice: (choice[0], -len(choice[3])))
         else:
             possible_saving = self.cost(selected) - self.cost(selected - candidates)
             estimate = 3.0 + sum(max(0.002, prices[self.tests[n]["id"]]) for n in candidates)
         if not candidates or possible_saving < estimate + 0.5:
             return selected, []
-        budget = min(self.cpu_budget - self.used_cpu, 8.0, max(3.5, estimate * 1.5))
+        budget = min(self.cpu_budget - self.used_cpu, 12.0 if progressive else 8.0, max(3.5, estimate * 1.5))
         try:
             self.start()
-            request = {"patch": patch, "tests": [self.tests[n]["id"] for n in sorted(candidates)],
+            budget = min(budget, self.cpu_budget - self.used_cpu)
+            if budget <= 0:
+                return selected, []
+            owners = {self.tests[n]['id'].rsplit('::', 1)[0] for n in candidates}
+            ordered_owners = sorted(owners, key=lambda owner: (
+                self.timing['setup'].get(owner, 0) if self.timing else 0,
+                min(prices[self.tests[n]['id']] for n in candidates if self.tests[n]['id'].rsplit('::', 1)[0] == owner), owner))
+            ordered = [n for owner in ordered_owners for n in sorted(candidates, key=lambda n: (prices[self.tests[n]['id']], n))
+                       if self.tests[n]['id'].rsplit('::', 1)[0] == owner]
+            self.last_probe = set(candidates)
+            request = {"patch": patch, "tests": [self.tests[n]["id"] for n in ordered],
                        "fixture_plans": {self.tests[n]['id']: fixture_plans[self.tests[n]['id']]
                                          for n in candidates if self.tests[n]['id'] in fixture_plans},
-                       "cpu_limit": budget, "wall_limit": min(15, max(2, self.deadline - time.monotonic()))}
+                       "cpu_limit": budget, "wall_limit": min(20 if progressive else 15, max(2, self.deadline - time.monotonic()))}
             self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
-            result = self.read(min(20, max(0.1, self.deadline - time.monotonic())))
+            result = self.read(min(22 if progressive else 20, max(0.1, self.deadline - time.monotonic())))
             self.used_cpu += result["cpu"]
+            if self.timing and not request['fixture_plans']:
+                # Whole-suite method timings exclude checkout, collection and
+                # cold imports. Price further exploration with their observed
+                # cost; the established planner keeps its existing estimates.
+                fixed = self.progressive_overhead if progressive else 1.0
+                self.progressive_overhead = max(self.progressive_overhead, result['cpu'] - (estimate - fixed))
             passed = {self.by_id[name] for name in result["passed"] if name in self.by_id} & candidates
             net = self.cost(selected) - self.cost(selected - passed) - result["cpu"]
-            if request['fixture_plans']:
+            if progressive:
+                self.progressive_unprofitable = self.progressive_unprofitable + 1 if net <= 0 else 0
+            elif request['fixture_plans']:
                 self.fixture_unprofitable = self.fixture_unprofitable + 1 if net <= 0 else 0
             else:
                 self.unprofitable = self.unprofitable + 1 if net <= 0 else 0

@@ -123,6 +123,12 @@ def load_profile(path):
                 or data['python'] != list(sys.version_info[:2]) or data['hashseed'] != '0'):
             return None
         for name, row in data['tests'].items():
+            fixtures = row.get('fixtures', [])
+            if (fixtures and sum(len(f['records']) for f in fixtures) != len(row['tasks'])) or any(
+                    not f['path'].startswith('tests/fixtures/optimizer/') or not f['path'].endswith('.sql')
+                    or len(f['hash']) != 64 or any(type(v) is not str or len(v) != 64 for v in f['records'])
+                    for f in fixtures):
+                return None
             limit = 1 << len(row['tasks'])
             if data['version'] == 2 and any(not 0 <= int(mask, 16) < limit for mask in row['sets']):
                 return None
@@ -171,6 +177,58 @@ def compact(data):
         row['sets'] = sets
     result['version'] = 2
     return result
+
+
+def fixture_records(text):
+    """Decode the pinned pair loader, including metadata and expectations."""
+    statements = '\n'.join(line for line in text.splitlines()
+                           if line and not line.startswith('--')).split(';')
+    records = []
+    try:
+        for i in range(0, len(statements) - 1, 2):
+            lines = statements[i].strip().split('\n')
+            meta, n = {}, 0
+            while lines[n].startswith('#'):
+                key, value = lines[n].split(':', 1)
+                meta[key.lstrip('#').strip()] = value.strip()
+                n += 1
+            record = [meta, '\n'.join(lines[n:]), statements[i + 1].strip()]
+            records.append(digest(json.dumps(record, separators=(',', ':'), ensure_ascii=True).encode()))
+    except (IndexError, ValueError) as error:
+        raise ValueError('unsupported fixture record') from error
+    return records
+
+
+def fixture_inputs(root, method, task_count):
+    """Bind task ordinals to unconditional pinned check_file pair loops."""
+    calls = []
+    def visit(node):
+        if node is not method and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == 'check_file' for n in ast.walk(node)):
+                raise ValueError('nested fixture loop')
+        if isinstance(node, (ast.If, ast.For, ast.While, ast.Try, ast.TryStar, ast.Match)):
+            if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == 'check_file' for n in ast.walk(node)):
+                raise ValueError('conditional fixture loop')
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'check_file':
+            if (not node.args or not isinstance(node.args[0], ast.Constant)
+                    or type(node.args[0].value) is not str
+                    or any(k.arg in {'only', None} for k in node.keywords)):
+                raise ValueError('dynamic fixture loop')
+            calls.append(node.args[0].value)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+    try:
+        visit(method)
+        fixtures = []
+        for name in calls:
+            path = 'tests/fixtures/optimizer/' + name + '.sql'
+            payload = (Path(root) / path).read_bytes()
+            fixtures.append(dict(path=path, hash=digest(payload), records=fixture_records(payload.decode('utf-8'))))
+        return fixtures if sum(len(f['records']) for f in fixtures) == task_count else []
+    except (OSError, UnicodeError, ValueError):
+        return []
 
 
 def independent_scope(tree, code):
@@ -229,7 +287,7 @@ def independent_scope(tree, code):
     return True
 
 
-def plan(profile, base, patch, names):
+def plan(profile, base, patch, names, *, allow_delta=True):
     """Price complete methods with only provably unaffected pool cases skipped."""
     from selector import apply_edit, parse_patch, same_ast
 
@@ -239,12 +297,17 @@ def plan(profile, base, patch, names):
     if not names:
         return {}
     edits = parse_patch(patch)
-    if not edits or any(not e.path.startswith('sqlglot/optimizer/') for e in edits):
+    code_edits = [e for e in edits if e.path.startswith('sqlglot/optimizer/')]
+    data_edits = [e for e in edits if e.path.startswith('tests/fixtures/optimizer/') and e.path.endswith('.sql')]
+    if data_edits and not allow_delta:
+        return {}
+    if (not edits or len(code_edits) + len(data_edits) != len(edits)
+            or len({e.path for e in edits}) != len(edits)):
         return {}
     if any(digest((Path(base) / p).read_bytes()) != h for p, h in profile['drivers'].items()):
         return {}
     scopes = []
-    for edit in edits:
+    for edit in code_edits:
         old = (Path(base) / edit.path).read_text()
         if profile['sources'].get(edit.path) != source_hash(old):
             return {}
@@ -271,6 +334,31 @@ def plan(profile, base, patch, names):
         # A task that changed shared state on the pinned run is never skipped,
         # even if it did not execute an edited scope.
         affected = {i for i, task in enumerate(row['tasks']) if not task.get('pure')}
+        delta_valid, delta_seen = True, False
+        offset = 0
+        for fixture in row.get('fixtures', []):
+            if digest((Path(base) / fixture['path']).read_bytes()) != fixture['hash']:
+                delta_valid = False
+                break
+            changes_here = [e for e in data_edits if e.path == fixture['path']]
+            if changes_here:
+                delta_seen = True
+                old = (Path(base) / fixture['path']).read_text(encoding='utf-8')
+                new, _ = apply_edit(old, changes_here[0])
+                records = fixture_records(new)
+                original = fixture['records']
+                if len(records) != len(original):
+                    delta_valid = False
+                    break
+                from collections import Counter
+                if records != original and Counter(records) == Counter(original):
+                    delta_valid = False
+                    break
+                affected.update(offset + i for i, (a, b) in enumerate(zip(original, records)) if a != b)
+            offset += len(fixture['records'])
+        if data_edits and (not delta_valid or not row.get('fixtures')
+                           or offset != len(row['tasks']) or (not code_edits and not delta_seen)):
+            continue
         for path, key, spans in scopes:
             entry = row['codes'].get(path, {}).get(key)
             if entry is None:
@@ -300,7 +388,8 @@ def plan(profile, base, patch, names):
         if affected:
             estimate += 0.7
         if len(affected) < len(row['tasks']) and estimate < row['cpu'] * 0.7:
-            found[name] = {'indices': sorted(affected), 'cpu': estimate, 'task_share': share}
+            found[name] = {'indices': sorted(affected), 'cpu': estimate, 'task_share': share,
+                           'fixture_delta': delta_seen}
     return found
 
 

@@ -19,6 +19,18 @@ def load_profile(path):
         if (data['revision'] != REVISION or data['kind'] != 'compiled_consumers' or data['version'] != 1
                 or data['python'] != list(sys.version_info[:2]) or len(data['tests']) != len(set(data['tests']))):
             return None
+        for path, entries in data.get('query_lines', {}).items():
+            for key, lines in entries.items():
+                row = data['codes'][path][key]
+                expected = sum(1 << i for i in row['queries'])
+                observed = 0
+                for line, value in lines.items():
+                    mask = int(value, 16)
+                    if int(line) <= 0 or line not in row['lines'] or mask <= 0 or mask & ~expected:
+                        return None
+                    observed |= mask
+                if row['query_outside'] or observed != expected:
+                    return None
         return data
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -107,8 +119,9 @@ def query_reachability(profile, base, patch):
             return None
         old = (Path(base) / edit.path).read_text()
         new, _ = apply_edit(old, edit)
+        trees = ast.parse(old), ast.parse(new)
         if (profile['sources'].get(edit.path) != source_hash(old)
-                or not same_ast(ast.parse(old), ast.parse(new), structure=True)):
+                or not same_ast(*trees, structure=True)):
             return None
         try:
             pairs = list(changes(compile(old, edit.path, 'exec', dont_inherit=True), compile(new, edit.path, 'exec', dont_inherit=True)))
@@ -123,6 +136,18 @@ def query_reachability(profile, base, patch):
                 continue
             if row is None or row['query_outside']:
                 return None
+            lines = profile.get('query_lines', {}).get(edit.path, {}).get(identity(before))
+            if lines:
+                from statementcheck import locations
+                spans = locations(*trees, before, after)
+                if spans and all(any(start <= int(n) <= end for n in lines) for start, end in spans):
+                    mask = 0
+                    for start, end in spans:
+                        for n, value in lines.items():
+                            if start <= int(n) <= end:
+                                mask |= int(value, 16)
+                    indices.update(i for i in row['queries'] if mask & (1 << i))
+                    continue
             indices.update(row['queries'])
     return indices
 
