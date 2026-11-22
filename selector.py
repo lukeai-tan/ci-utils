@@ -772,6 +772,8 @@ def main():
     parser.add_argument('--no-fixture-delta', action='store_true')
     parser.add_argument('--no-mixed-planning', action='store_true')
     parser.add_argument('--no-progressive-verification', action='store_true')
+    parser.add_argument('--pass-checkpoints', type=Path, default=Path(__file__).parent / 'maps/passes.pkl.xz')
+    parser.add_argument('--no-pass-replay', action='store_true')
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -812,6 +814,7 @@ def main():
                                                timing=load_timing(args.timing),
                                                task_queries=None if args.no_query_replay else args.task_queries,
                                                fixtures=None if args.no_fixture_replay else args.fixture_cases,
+                                               passes=None if args.no_pass_replay else args.pass_checkpoints,
                                                fixture_delta=not args.no_fixture_delta,
                                                progressive=not args.no_progressive_verification,
                                                compiled=compiled)

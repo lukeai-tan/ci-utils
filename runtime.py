@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from importlib.util import MAGIC_NUMBER
 from pathlib import Path
 
 
@@ -121,8 +122,17 @@ class PatchedTree:
         try:
             for path in self.base.rglob("*"):
                 relative = path.relative_to(self.base)
-                if any(part in (".git", "__pycache__", ".pytest_cache", ".mypy_cache") for part in relative.parts):
+                if any(part in (".git", ".pytest_cache", ".mypy_cache") for part in relative.parts):
                     continue
+                if '__pycache__' in relative.parts:
+                    if not path.is_file() or path.suffix != '.pyc':
+                        continue
+                    with path.open('rb') as cache:
+                        header = cache.read(8)
+                    # Checked hashes force edited sources to compile afresh,
+                    # even when their length and timestamp match the baseline.
+                    if header[:4] != MAGIC_NUMBER or int.from_bytes(header[4:8], 'little') != 3:
+                        continue
                 if path.is_file():
                     target = self.root / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +215,7 @@ def cpu_seconds():
     return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
 
 
-def serve(base, queries=None, task_queries=None, fixtures=None):
+def serve(base, queries=None, task_queries=None, fixtures=None, passes=None):
     os.environ.update(PYTHONDONTWRITEBYTECODE="1", OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1",
                       NUMEXPR_MAX_THREADS="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     import pytest  # Warm third-party imports only; patched packages load in children.
@@ -219,16 +229,21 @@ def serve(base, queries=None, task_queries=None, fixtures=None):
         from queryreplay import load_profile
         task_baseline = load_profile(task_queries)
     fixture_baseline = None
+    pass_baseline = None
 
     print(json.dumps({"ready": True, "cpu": cpu_seconds()}), flush=True)
     for line in sys.stdin:
         started = cpu_seconds()
         try:
             request = json.loads(line)
+            if passes is not None and request.get('kind') == 'optimizer_passes' and pass_baseline is None:
+                from passcheck import load_profile
+                pass_baseline = load_profile(passes)
             if fixtures is not None and request.get('fixture_plans') and fixture_baseline is None:
                 from fixturecheck import load_profile
                 fixture_baseline = load_profile(fixtures)
-            if any("test_executor.py" in name or "test_optimizer.py" in name for name in request.get("tests", [])):
+            if (request.get('kind') != 'optimizer_passes'
+                    and any("test_executor.py" in name or "test_optimizer.py" in name for name in request.get("tests", []))):
                 import duckdb
                 import numpy
                 import pandas
@@ -241,7 +256,12 @@ def serve(base, queries=None, task_queries=None, fixtures=None):
                         with open(os.devnull, "w") as sink:
                             os.dup2(sink.fileno(), 1)
                             os.dup2(sink.fileno(), 2)
-                        if request.get("kind") == "task_queries" and task_baseline is not None:
+                        if request.get('kind') == 'optimizer_passes' and pass_baseline is not None:
+                            from passcheck import replay
+                            signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError('pass replay CPU budget')))
+                            signal.setitimer(signal.ITIMER_PROF, request['cpu_limit'])
+                            result = replay(tree.root, pass_baseline, request['indices'])
+                        elif request.get("kind") == "task_queries" and task_baseline is not None:
                             from queryreplay import replay
                             signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError("task replay CPU budget")))
                             signal.setitimer(signal.ITIMER_PROF, request["cpu_limit"])
@@ -293,7 +313,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None):
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, fixture_delta=True, progressive=True, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, fixture_delta=True, progressive=True, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -321,6 +341,10 @@ class Verifier:
         self.behavior = behavior
         self.task_queries = Path(task_queries) if task_queries is not None else None
         self.task_baseline = None
+        self.passes = Path(passes) if passes is not None else None
+        self.pass_available = self.passes is not None and self.passes.is_file()
+        self.pass_baseline = None
+        self.pass_unprofitable = 0
         self.fixtures = Path(fixtures) if fixtures is not None else None
         self.fixture_baseline = None
         self.fixture_available = self.fixtures is not None and self.fixtures.is_file()
@@ -368,6 +392,8 @@ class Verifier:
                 command.extend(["--task-queries", str(self.task_queries.resolve())])
             if self.fixture_available:
                 command.extend(["--fixtures", str(self.fixtures.resolve())])
+            if self.pass_available:
+                command.extend(['--passes', str(self.passes.resolve())])
             self.process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -383,8 +409,11 @@ class Verifier:
         from valuecheck import validated_change
 
         number = self.by_id.get(TEST)
-        if (self.disabled or self.task_unprofitable >= 2 or not self.task_available or number not in selected or number in protected
+        if (self.disabled or number not in selected or number in protected
                 or self.used_cpu >= self.cpu_budget or time.monotonic() >= self.deadline):
+            return selected, []
+        if ((not self.task_available or self.task_unprofitable >= 2)
+                and (not self.pass_available or self.pass_unprofitable >= 2)):
             return selected, []
         saving = self.cost(selected) - self.cost(selected - {number})
         if saving < 8:
@@ -394,6 +423,12 @@ class Verifier:
             planning_patch = patch if planning_patch is None else planning_patch
             edits = parse_patch(planning_patch)
             if not edits or any(not e.path.startswith('sqlglot/optimizer/') for e in edits):
+                return selected, []
+            if self.pass_available and self.pass_unprofitable < 2:
+                retained, notes, attempted = self.pass_refine(patch, planning_patch, selected, number, saving)
+                if attempted:
+                    return retained, notes
+            if not self.task_available or self.task_unprofitable >= 2:
                 return selected, []
             change = None
             if len(edits) == 1:
@@ -457,6 +492,44 @@ class Verifier:
             self.close()
             self.task_unprofitable += 1
             return selected, ["task replay unavailable; retained executor"]
+
+    def pass_refine(self, patch, planning_patch, selected, number, saving):
+        from passcheck import load_profile, plan
+        try:
+            if self.pass_baseline is None:
+                self.pass_baseline = load_profile(self.passes)
+                if self.pass_baseline is None:
+                    self.pass_available = False
+                    return selected, [], False
+            candidate = plan(self.pass_baseline, self.compiled, self.base, planning_patch)
+            if candidate is None:
+                return selected, [], False
+            indices, estimate = candidate
+            budget = min(12.0, saving * 0.6, self.cpu_budget - self.used_cpu)
+            # Recorded suffix costs include restoration and state comparison.
+            # Add fork/import overhead and variance; incomplete work retains
+            # the executor even when the actual replay exceeds this estimate.
+            if 1.0 + estimate * 1.35 > budget:
+                return selected, [], False
+            self.start()
+            budget = min(budget, self.cpu_budget - self.used_cpu)
+            if budget <= 0:
+                return selected, [], False
+            request = dict(kind='optimizer_passes', patch=patch, tests=[self.tests[number]['id']], indices=indices,
+                           cpu_limit=budget, wall_limit=min(20, max(0.1, self.deadline-time.monotonic())))
+            self.process.stdin.write(json.dumps(request, separators=(',', ':'))+'\n')
+            self.process.stdin.flush()
+            result = self.read(min(22, max(0.1, self.deadline-time.monotonic())))
+            self.used_cpu += result['cpu']
+            if result.get('passed') == [self.tests[number]['id']] and result.get('replayed_passes') == len(indices):
+                self.pass_unprofitable = self.pass_unprofitable + 1 if result['cpu'] >= saving else 0
+                return selected-{number}, [f'verified {len(indices)} optimizer passes with exact input graphs and shared state'], True
+            self.pass_unprofitable += 1
+            return selected, ['optimizer pass replay changed or incomplete; retained executor'], True
+        except (OSError, ValueError, KeyError, TypeError, EOFError, TimeoutError, RecursionError, SyntaxError):
+            self.close()
+            self.pass_unprofitable += 1
+            return selected, ['optimizer pass replay unavailable; retained executor'], True
 
     def query_refine(self, patch, selected):
         from querycheck import METHODS, supported_patch
@@ -647,6 +720,7 @@ if __name__ == "__main__":
     parser.add_argument("--queries", type=Path)
     parser.add_argument("--task-queries", type=Path)
     parser.add_argument("--fixtures", type=Path)
+    parser.add_argument('--passes', type=Path)
     args = parser.parse_args()
     if args.serve:
-        serve(args.source, args.queries, args.task_queries, args.fixtures)
+        serve(args.source, args.queries, args.task_queries, args.fixtures, args.passes)

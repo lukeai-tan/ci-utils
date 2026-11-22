@@ -9,6 +9,7 @@
 !compiledcheck.py
 !statementcheck.py
 !fixturecheck.py
+!passcheck.py
 !fieldcheck.py
 !maps/
 !maps/baseline.json.gz
@@ -21,6 +22,7 @@
 !maps/timing.json.gz
 !maps/compiled.json.gz
 !maps/fixtures.json.gz
+!maps/passes.pkl.xz
 !maps/fields.json.gz
 !maps/queries.pkl.gz
 !requirements.lock

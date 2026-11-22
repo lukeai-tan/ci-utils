@@ -31,6 +31,7 @@ output*.jsonl
 !/tools/merge_compiled_profiles.py
 !/tools/build_fixture_profile.py
 !/tools/build_query_lines.py
+!/tools/build_pass_profile.py
 
 # Private research must never be included by normal staging.
 **/public-research*
