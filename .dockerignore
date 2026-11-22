@@ -31,7 +31,6 @@
 !maps/fields.json.gz
 !maps/queries.pkl.gz
 !maps/dispatch.json.gz
-!maps/stages.pkl.xz
 !requirements.lock
 !LICENSE
 !tools/

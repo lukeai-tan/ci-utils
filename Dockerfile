@@ -14,7 +14,7 @@ COPY requirements.lock /app/requirements.lock
 RUN python -m pip install --no-cache-dir -r /app/requirements.lock
 COPY --from=baseline /source /app/source
 COPY selector.py runtime.py querycheck.py comparisoncheck.py valuecheck.py queryreplay.py behaviorcheck.py compiledcheck.py fieldcheck.py statementcheck.py fixturecheck.py passcheck.py relationcheck.py statecheck.py stagecheck.py dispatchcheck.py warmcheck.py /app/
-COPY maps/baseline.json.gz maps/runtime.json.gz maps/settings.json.gz maps/comparisons.json.gz maps/values.json.gz maps/query-values.pkl.gz maps/queries.pkl.gz maps/behavior.json.gz maps/timing.json.gz maps/compiled.json.gz maps/fields.json.gz maps/fixtures.json.gz maps/passes.pkl.xz maps/dispatch.json.gz maps/stages.pkl.xz /app/maps/
+COPY maps/baseline.json.gz maps/runtime.json.gz maps/settings.json.gz maps/comparisons.json.gz maps/values.json.gz maps/query-values.pkl.gz maps/queries.pkl.gz maps/behavior.json.gz maps/timing.json.gz maps/compiled.json.gz maps/fields.json.gz maps/fixtures.json.gz maps/passes.pkl.xz maps/dispatch.json.gz /app/maps/
 RUN python -c 'import gzip,lzma; from pathlib import Path; p=Path("/app/maps/query-values.pkl.gz"); raw=gzip.decompress(p.read_bytes()); raw=lzma.decompress(raw) if raw.startswith(b"\xfd7zXZ\x00") else raw; p.write_bytes(gzip.compress(raw,mtime=0))' \
     && python /app/statecheck.py --source /app/source --out /app/maps/import-state.json.gz
 COPY LICENSE tools/SQLGLOT_LICENSE /app/licenses/
