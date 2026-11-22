@@ -355,7 +355,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None, sta
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, aggressive_min_cpu=4.0, aggressive_broad=False, aggressive_small_groups=False, verified_medium_groups=False, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, aggressive_min_cpu=4.0, aggressive_broad=False, aggressive_small_groups=False, verified_medium_groups=False, aggressive_medium_probes=False, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -380,6 +380,7 @@ class Verifier:
         self.aggressive = aggressive
         self.aggressive_min_cpu = aggressive_min_cpu
         self.aggressive_broad = aggressive_broad
+        self.aggressive_medium_probes = aggressive_medium_probes
         self.aggressive_small_groups = aggressive_small_groups
         self.small_group_cpu = 0.0
         self.verified_medium_groups = verified_medium_groups
@@ -785,12 +786,15 @@ class Verifier:
         if not expensive:
             return self.small_group_refine(patch, selected, protected=protected)
         saving = self.cost(selected) - self.cost(selected - expensive)
-        cheap = sorted((n for n in eligible - expensive
-                        if self.tests[n]['id'] in prices and prices[self.tests[n]['id']] <= .35),
+        probe_pool = eligible if self.aggressive_medium_probes else eligible - expensive
+        probe_limit = 1.0 if self.aggressive_medium_probes else .35
+        cheap = sorted((n for n in probe_pool
+                        if self.tests[n]['id'] in prices and prices[self.tests[n]['id']] <= probe_limit),
                        key=lambda n: (prices[self.tests[n]['id']], n))
-        if not cheap or saving < 4:
+        if not cheap or saving < (3 if self.aggressive_medium_probes else 4):
             return self.small_group_refine(patch, selected, protected=protected)
-        budget = min(2.5, saving * .35, self.cpu_budget - self.used_cpu, 20 - self.aggressive_cpu)
+        fraction = .65 if self.aggressive_medium_probes else .35
+        budget = min(2.5, saving * fraction, self.cpu_budget - self.used_cpu, 20 - self.aggressive_cpu)
         if self.medium_group_cpu and budget < 2.5:
             return selected, []  # Extra verification must not weaken an existing speculative probe.
         if budget < 1.5:
@@ -829,7 +833,9 @@ class Verifier:
             self.aggressive_attempted = set(candidates)
             result = self.read(min(12, max(.1, self.deadline - time.monotonic())))
             self.used_cpu += result['cpu']
-            passed = {self.by_id[name] for name in result.get('passed', []) if name in self.by_id} & set(candidates)
+            passing_names = (set(result.get('passed', [])) - set(result.get('failed', []))
+                             - set(result.get('incomplete', [])))
+            passed = {self.by_id[name] for name in passing_names if name in self.by_id} & set(candidates)
             clean = (result.get('completed') is True and not result.get('failed')
                      and not result.get('incomplete') and 'error' not in result
                      and set(result.get('passed', [])) == set(names))
