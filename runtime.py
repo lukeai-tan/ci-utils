@@ -514,7 +514,19 @@ class Verifier:
                     continue
                 owners = {self.tests[n]["id"].rsplit("::", 1)[0] for n in bundle}
                 estimate = 1.0 + sum(max(0.002, prices[self.tests[n]["id"]]) for n in bundle)
-                estimate += sum(self.timing["setup"].get(owner, 0) + self.timing["teardown"].get(owner, 0) for owner in owners)
+                for owner in owners:
+                    teardown = self.timing['teardown'].get(owner, 0)
+                    methods = [self.tests[n]['id'] for n in bundle
+                               if self.tests[n]['id'].rsplit('::', 1)[0] == owner]
+                    if all(name in fixture_plans for name in methods):
+                        # The pristine class-wide shutdown includes pool work
+                        # accumulated across its methods. Restricted replay
+                        # starts a fresh pool and reaps only its selected tasks.
+                        # Preserve a fixed shutdown allowance; mixed bundles
+                        # retain the original estimate for untrimmed methods.
+                        share = max(fixture_plans[name]['task_share'] for name in methods)
+                        teardown = min(teardown, 0.25 + teardown * share)
+                    estimate += self.timing['setup'].get(owner, 0) + teardown
                 saving = current_cost - self.cost(selected - bundle)
                 expected = saving * 0.7 ** min(len(bundle), 4) - estimate
                 if expected > 0.1:

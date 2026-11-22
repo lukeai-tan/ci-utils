@@ -300,7 +300,7 @@ def plan(profile, base, patch, names):
         if affected:
             estimate += 0.7
         if len(affected) < len(row['tasks']) and estimate < row['cpu'] * 0.7:
-            found[name] = {'indices': sorted(affected), 'cpu': estimate}
+            found[name] = {'indices': sorted(affected), 'cpu': estimate, 'task_share': share}
     return found
 
 
