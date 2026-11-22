@@ -774,6 +774,15 @@ def main():
     parser.add_argument('--no-progressive-verification', action='store_true')
     parser.add_argument('--pass-checkpoints', type=Path, default=Path(__file__).parent / 'maps/passes.pkl.xz')
     parser.add_argument('--no-pass-replay', action='store_true')
+    parser.add_argument('--stage-profile', type=Path, default=Path(__file__).parent / 'maps/stages.pkl.xz')
+    parser.add_argument('--import-profile', type=Path, default=Path(__file__).parent / 'maps/import-state.json.gz')
+    parser.add_argument('--dispatch-profile', type=Path, default=Path(__file__).parent / 'maps/dispatch.json.gz')
+    parser.add_argument('--no-stage-replay', action='store_true')
+    parser.add_argument('--stage-replay', action='store_true')
+    parser.add_argument('--no-import-verification', action='store_true')
+    parser.add_argument('--import-verification', action='store_true')
+    parser.add_argument('--no-warm-verification', action='store_true')
+    parser.add_argument('--warm-verification', action='store_true')
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -808,6 +817,7 @@ def main():
     if behavior:
         mapping["local_behavior"] = behavior
     selector = Selector(mapping, tests)
+    from dispatchcheck import load_profile as load_dispatch
     verifier = None if args.static else Verifier(args.source, profile, tests, selector.schedule,
                                                queries=args.queries if args.query_checks else None,
                                                values=values, behavior=behavior,
@@ -815,6 +825,10 @@ def main():
                                                task_queries=None if args.no_query_replay else args.task_queries,
                                                fixtures=None if args.no_fixture_replay else args.fixture_cases,
                                                passes=None if args.no_pass_replay else args.pass_checkpoints,
+                                               stages=args.stage_profile if args.stage_replay and not args.no_stage_replay else None,
+                                               imported=args.import_profile if args.import_verification and not args.no_import_verification else None,
+                                               dispatch=load_dispatch(args.dispatch_profile) if args.import_verification else None,
+                                               warm=mapping.get('startup') if args.warm_verification and not args.no_warm_verification else None,
                                                fixture_delta=not args.no_fixture_delta,
                                                progressive=not args.no_progressive_verification,
                                                compiled=compiled)
@@ -846,6 +860,11 @@ def main():
                 except (ValueError, KeyError):
                     protected.update(selector.all)
                     data_readers.update(selector.all)
+                verifier.protected = protected
+                chosen, checked = verifier.import_refine(patch, chosen, protected=protected)
+                reasons.extend(checked)
+                chosen, checked = verifier.stage_refine(patch, chosen, protected=protected)
+                reasons.extend(checked)
                 chosen, checked = verifier.task_query_refine(patch, chosen, protected=protected, planning_patch=code_patch)
                 reasons.extend(checked)
                 chosen, checked = verifier.query_refine(patch, chosen)

@@ -11,6 +11,11 @@
 !fixturecheck.py
 !passcheck.py
 !fieldcheck.py
+!relationcheck.py
+!statecheck.py
+!stagecheck.py
+!dispatchcheck.py
+!warmcheck.py
 !maps/
 !maps/baseline.json.gz
 !maps/runtime.json.gz
@@ -25,6 +30,8 @@
 !maps/passes.pkl.xz
 !maps/fields.json.gz
 !maps/queries.pkl.gz
+!maps/dispatch.json.gz
+!maps/stages.pkl.xz
 !requirements.lock
 !LICENSE
 !tools/

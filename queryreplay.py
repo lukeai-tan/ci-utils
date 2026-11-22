@@ -6,6 +6,7 @@ import ast
 import datetime
 import decimal
 import gzip
+import lzma
 import hashlib
 import json
 import lzma
@@ -156,7 +157,10 @@ def decode_chunk(data, key):
 def load_profile(path):
     try:
         with gzip.open(path, "rb") as stream:
-            data = pickle.load(stream)
+            raw = stream.read()
+        if raw.startswith(b'\xfd7zXZ\x00'):
+            raw = lzma.decompress(raw)
+        data = pickle.loads(raw)
     except (pickle.UnpicklingError, EOFError) as error:
         raise ValueError("invalid executor task baseline") from error
     if (data["revision"] != REVISION or data["version"] not in (1, 2) or data["kind"] != "executor_tasks"

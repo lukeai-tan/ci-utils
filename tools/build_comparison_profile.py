@@ -28,7 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from comparisoncheck import COMPARISONS, REVISION, identity_equality_pair, location, operand_types, source_hash
 
 
-OPERATORS = {"Eq": operator.eq, "NotEq": operator.ne, "Is": operator.is_, "IsNot": operator.is_not}
+OPERATORS = {"Eq": operator.eq, "NotEq": operator.ne, "Is": operator.is_, "IsNot": operator.is_not,
+             "Lt": operator.lt, "LtE": operator.le, "Gt": operator.gt, "GtE": operator.ge}
 ACTIVE = None
 
 
@@ -68,7 +69,8 @@ def compile_profile(data):
         )
     profile = {key: data[key] for key in ("revision", "kind", "tests", "sources",
                                          "complete", "cpu", "collection_complete")}
-    profile.update(version=3, bad=data.get("bad", []), certified=certified)
+    profile.update(version=3, bad=data.get("bad", []), certified=certified,
+                   relations=data.get('relations', {}))
     return profile
 
 
@@ -76,14 +78,14 @@ def compact_certificates(profile):
     """Store the same certified baseline contexts as bounded bit sets."""
     if profile['version'] != 3:
         raise ValueError('compiled comparison profile required')
-    return dict(profile, version=4, certified={
+    return dict(profile, version=5 if profile.get('relations') else 4, certified={
         key: format(sum(1 << i for i in set(contexts)), 'x')
         for key, contexts in profile['certified'].items()})
 
 
 def merge_certificates(baseline, measured, selected):
     """Replace measured contexts, including failed or missing worker evidence."""
-    if (baseline['version'] not in (3, 4) or measured['version'] not in (3, 4)
+    if (baseline['version'] not in (3, 4, 5) or measured['version'] not in (3, 4, 5)
             or baseline['revision'] != measured['revision'] or baseline['tests'] != measured['tests']
             or baseline['kind'] != measured['kind'] or not baseline['collection_complete']
             or not measured['collection_complete']
@@ -104,7 +106,19 @@ def merge_certificates(baseline, measured, selected):
     cpu = dict(baseline['cpu'])
     cpu.update(measured['cpu'])
     bad = (set(baseline.get('bad', [])) - {str(i) for i in selected}) | set(measured.get('bad', []))
-    return dict(baseline, version=3, certified=certified, complete=sorted(complete), cpu=cpu, bad=sorted(bad))
+    relations = {}
+    for key in baseline.get('relations', {}).keys() | measured.get('relations', {}).keys():
+        rows = {context: codes for context, codes in baseline.get('relations', {}).get(key, {}).items()
+                if context != 'startup' and int(context) not in selected}
+        rows.update(measured.get('relations', {}).get(key, {}))
+        # Startup effects from either recording remain conservatively visible.
+        startup = set(baseline.get('relations', {}).get(key, {}).get('startup', []))
+        startup.update(measured.get('relations', {}).get(key, {}).get('startup', []))
+        if startup:
+            rows['startup'] = sorted(startup)
+        relations[key] = rows
+    return dict(baseline, version=3, certified=certified, complete=sorted(complete), cpu=cpu,
+                bad=sorted(bad), relations=relations)
 
 
 class Recorder:
@@ -115,6 +129,7 @@ class Recorder:
         self.current = context
         self.directory = Path(directory) if directory else None
         self.operands = defaultdict(lambda: defaultdict(set))
+        self.relations = defaultdict(lambda: defaultdict(set))
         self.sources = {}
         self.complete = set()
         self.phases = defaultdict(set)
@@ -131,6 +146,8 @@ class Recorder:
         return [context]
 
     def comparison(self, key, op, left, right):
+        from relationcheck import observe
+        self.relations[key][self.current].add(observe(left, right))
         self.operands[key][self.current].add(operand_types(left, right))
         return OPERATORS[op](left, right)
 
@@ -150,6 +167,10 @@ class Recorder:
                     self.operands[key][index].update(tuple(tuple(value) for value in pair) for pair in pairs)
         for context in data.get('bad', []):
             self.bad.update(self.contexts(context))
+        for key, contexts in data.get('relations', {}).items():
+            for context, codes in contexts.items():
+                for index in self.contexts(context):
+                    self.relations[key][index].update(codes)
 
     def finish_children(self):
         """Wait until class cleanup has joined every persistent worker."""
@@ -169,7 +190,9 @@ class Recorder:
                     sources=self.sources, operands={key: {context: sorted(pairs) for context, pairs in contexts.items()}
                                                    for key, contexts in self.operands.items()},
                     complete=sorted(self.complete), cpu=self.cpu, bad=sorted(self.bad),
-                    collection_complete=self.collection_complete)
+                    collection_complete=self.collection_complete,
+                    relations={key: {context: sorted(codes) for context, codes in contexts.items()}
+                               for key, contexts in self.relations.items()})
 
     def pytest_collection_finish(self, session):
         self.collection_complete = not session.testsfailed
@@ -202,7 +225,7 @@ class Instrument(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
-        if len(node.ops) != 1 or not isinstance(node.ops[0], COMPARISONS):
+        if len(node.ops) != 1 or type(node.ops[0]).__name__ not in OPERATORS:
             return node
         call = ast.Call(ast.Name("_ci_compare_observe", ast.Load()),
                         [ast.Constant(location(self.path, node)), ast.Constant(type(node.ops[0]).__name__),

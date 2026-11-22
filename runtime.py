@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import gzip
 import json
 import math
@@ -215,7 +216,7 @@ def cpu_seconds():
     return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
 
 
-def serve(base, queries=None, task_queries=None, fixtures=None, passes=None):
+def serve(base, queries=None, task_queries=None, fixtures=None, passes=None, stages=None, warm=False, imported=None):
     os.environ.update(PYTHONDONTWRITEBYTECODE="1", OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1",
                       NUMEXPR_MAX_THREADS="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     import pytest  # Warm third-party imports only; patched packages load in children.
@@ -230,19 +231,36 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None):
         task_baseline = load_profile(task_queries)
     fixture_baseline = None
     pass_baseline = None
+    stage_baseline = None
+    warm_compiled = warm_startup = None
+    if warm:
+        from compiledcheck import load_profile
+        warm_compiled = load_profile(Path(__file__).parent / 'maps/compiled.json.gz')
+        with gzip.open(Path(__file__).parent / 'maps/baseline.json.gz', 'rt') as stream:
+            warm_startup = json.load(stream)['startup']
 
     print(json.dumps({"ready": True, "cpu": cpu_seconds()}), flush=True)
     for line in sys.stdin:
         started = cpu_seconds()
         try:
             request = json.loads(line)
+            replacements = None
+            if warm:
+                from warmcheck import plan, preload
+                replacements = plan(base, request['patch'], warm_compiled, warm_startup)
+                if replacements is None or request.get('kind'):
+                    raise ValueError('unsupported warm request')
+                preload(base, request['tests'])
+            if request.get('kind') == 'stages' and stage_baseline is None:
+                from stagecheck import load_profile
+                stage_baseline = load_profile(stages)
             if passes is not None and request.get('kind') == 'optimizer_passes' and pass_baseline is None:
                 from passcheck import load_profile
                 pass_baseline = load_profile(passes)
             if fixtures is not None and request.get('fixture_plans') and fixture_baseline is None:
                 from fixturecheck import load_profile
                 fixture_baseline = load_profile(fixtures)
-            if (request.get('kind') != 'optimizer_passes'
+            if (request.get('kind') not in {'optimizer_passes', 'stages', 'import_state'}
                     and any("test_executor.py" in name or "test_optimizer.py" in name for name in request.get("tests", []))):
                 import duckdb
                 import numpy
@@ -256,7 +274,24 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None):
                         with open(os.devnull, "w") as sink:
                             os.dup2(sink.fileno(), 1)
                             os.dup2(sink.fileno(), 2)
-                        if request.get('kind') == 'optimizer_passes' and pass_baseline is not None:
+                        if warm:
+                            from warmcheck import swap
+                            swap(base, replacements)
+                        if request.get('kind') == 'import_state':
+                            from statecheck import load_all, snapshot, delta
+                            signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError('import state CPU budget')))
+                            signal.setitimer(signal.ITIMER_PROF, request['cpu_limit'])
+                            load_all(tree.root)
+                            with gzip.open(imported, 'rt') as stream:
+                                baseline = json.load(stream)['values']
+                            changed, unknown = delta(baseline, snapshot())
+                            result = {'passed': [], 'changed': sorted(changed), 'unknown': sorted(unknown)}
+                        elif request.get('kind') == 'stages' and stage_baseline is not None:
+                            from stagecheck import replay
+                            signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError('stage replay CPU budget')))
+                            signal.setitimer(signal.ITIMER_PROF, request['cpu_limit'])
+                            result = replay(tree.root, stage_baseline, request['indices'])
+                        elif request.get('kind') == 'optimizer_passes' and pass_baseline is not None:
                             from passcheck import replay
                             signal.signal(signal.SIGPROF, lambda *args: (_ for _ in ()).throw(TimeoutError('pass replay CPU budget')))
                             signal.setitimer(signal.ITIMER_PROF, request['cpu_limit'])
@@ -301,7 +336,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None):
                         if not chunk:
                             break
                         payload.extend(chunk)
-                        if len(payload) > 2 * 1024**2:
+                        if len(payload) > 8 * 1024**2:
                             os.killpg(os.getpgrp(), signal.SIGKILL)
                 os.close(read_fd)
                 os.waitpid(child, 0)
@@ -313,7 +348,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None):
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, fixture_delta=True, progressive=True, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -321,6 +356,8 @@ class Verifier:
         self.by_id = {test["id"]: test["number"] for test in tests}
         self.schedule = schedule
         self.process = None
+        self.processes = {}
+        self.warm_mode = False
         self.used_cpu = 0.0
         self.cpu_budget = cpu_budget
         self.deadline = time.monotonic() + wall_budget
@@ -345,6 +382,14 @@ class Verifier:
         self.pass_available = self.passes is not None and self.passes.is_file()
         self.pass_baseline = None
         self.pass_unprofitable = 0
+        self.stages = Path(stages) if stages is not None else None
+        self.stage_baseline = None
+        self.stage_unprofitable = 0
+        self.imported = Path(imported) if imported is not None else None
+        self.import_baseline = None
+        self.import_unprofitable = 0
+        self.dispatch = dispatch
+        self.warm = warm
         self.fixtures = Path(fixtures) if fixtures is not None else None
         self.fixture_baseline = None
         self.fixture_available = self.fixtures is not None and self.fixtures.is_file()
@@ -362,16 +407,22 @@ class Verifier:
                     for worker in workers), default=0) / 1000 + 2 * len(workers)
 
     def close(self):
-        if self.process is not None:
-            if self.process.poll() is None:
+        processes = list(self.processes.values()) + ([self.process] if self.process is not None else [])
+        seen = set()
+        for process in processes:
+            if id(process) in seen:
+                continue
+            seen.add(id(process))
+            if process.poll() is None:
                 try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            self.process.wait()
-            self.process.stdin.close()
-            self.process.stdout.close()
-            self.process = None
+            process.wait()
+            process.stdin.close()
+            process.stdout.close()
+        self.processes.clear()
+        self.process = None
 
     def read(self, timeout):
         with selectors.DefaultSelector() as selector:
@@ -383,9 +434,15 @@ class Verifier:
             raise EOFError("verification worker exited")
         return json.loads(line)
 
-    def start(self):
+    def start(self, warm=False):
+        if self.process is not None:
+            self.processes[self.warm_mode] = self.process
+        self.warm_mode = warm
+        self.process = self.processes.get(warm)
         if self.process is None:
             command = [sys.executable, "-B", str(Path(__file__).resolve()), "--serve", "--source", str(self.base.resolve())]
+            if warm:
+                command.append('--warm')
             if self.queries is not None:
                 command.extend(["--queries", str(self.queries.resolve())])
             if self.task_baseline is not None:
@@ -394,6 +451,10 @@ class Verifier:
                 command.extend(["--fixtures", str(self.fixtures.resolve())])
             if self.pass_available:
                 command.extend(['--passes', str(self.passes.resolve())])
+            if self.stages is not None and self.stages.is_file():
+                command.extend(['--stages', str(self.stages.resolve())])
+            if self.imported is not None and self.imported.is_file():
+                command.extend(['--imported', str(self.imported.resolve())])
             self.process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -402,6 +463,126 @@ class Verifier:
                      "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "NUMEXPR_MAX_THREADS": "1"},
             )
             self.used_cpu += self.read(10)["cpu"]
+            self.processes[warm] = self.process
+
+    def import_refine(self, patch, selected, *, protected=()):
+        from statecheck import changed_sources, delta, projected
+        from comparisoncheck import source_hash
+        if (self.disabled or self.imported is None or not self.imported.is_file()
+                or not self.compiled or self.import_unprofitable >= 2
+                or self.used_cpu >= self.cpu_budget or time.monotonic() >= self.deadline):
+            return selected, []
+        candidates = selected - set(protected)
+        saving = self.cost(selected) - self.cost(selected - candidates)
+        if saving < 4:
+            return selected, []
+        try:
+            # Ordinary body edits already have complete code/statement evidence.
+            # Spend cold import CPU only on initialization or callback factories.
+            from selector import same_ast, parse_patch, apply_edit
+            from compiledcheck import changes as code_changes
+            relevant = False
+            for edit in parse_patch(patch):
+                old = (self.base / edit.path).read_text()
+                new, _ = apply_edit(old, edit)
+                if not same_ast(ast.parse(old), ast.parse(new), structure=True):
+                    relevant = True
+                    break
+                for before, after in code_changes(compile(old, edit.path, 'exec', dont_inherit=True),
+                                                  compile(new, edit.path, 'exec', dont_inherit=True)):
+                    if before.co_name == '<lambda>' or before.co_cellvars or after.co_cellvars:
+                        relevant = True
+                        break
+            if not relevant:
+                return selected, []
+            changes = changed_sources(self.base, patch)
+            if not changes:
+                return selected, []
+            if self.import_baseline is None:
+                with gzip.open(self.imported, 'rt') as stream:
+                    self.import_baseline = json.load(stream)
+                data = self.import_baseline
+                if (data['revision'] != REVISION or data['version'] != 1
+                        or data['python'] != list(sys.version_info[:2])):
+                    self.imported = None
+                    return selected, []
+            if any(self.import_baseline['sources'].get(path) != source_hash(a) for path, (a, b) in changes.items()):
+                return selected, []
+            self.start()
+            budget = min(12, saving * 0.5, self.cpu_budget - self.used_cpu)
+            if budget < 8:
+                return selected, []
+            request = dict(kind='import_state', patch=patch, tests=[], cpu_limit=budget,
+                           wall_limit=min(20, max(.1, self.deadline-time.monotonic())))
+            self.process.stdin.write(json.dumps(request, separators=(',', ':'))+'\n')
+            self.process.stdin.flush()
+            result = self.read(min(22, max(.1, self.deadline-time.monotonic())))
+            self.used_cpu += result['cpu']
+            if 'changed' not in result or 'unknown' not in result:
+                self.import_unprofitable += 1
+                return selected, ['imported-state verification incomplete; retained candidates']
+            changed, unknown = set(result['changed']), set(result['unknown'])
+            certified = projected(self.compiled, self.base, changes, changed,
+                                  list(self.tests.values()), unknown=unknown, dispatch=self.dispatch)
+            retained = selected - ((certified or set()) & candidates)
+            net = self.cost(selected) - self.cost(retained) - result['cpu']
+            self.import_unprofitable = self.import_unprofitable + 1 if net <= 0 else 0
+            return retained, [f'checked imported state and dispatch; removed {len(selected-retained)} candidates']
+        except (OSError, ValueError, KeyError, TypeError, SyntaxError, RecursionError, TimeoutError, EOFError):
+            self.close()
+            self.import_unprofitable += 1
+            return selected, ['imported-state evidence unavailable; retained candidates']
+
+    def stage_refine(self, patch, selected, *, protected=()):
+        from stagecheck import METHODS, load_profile, plan
+        if (self.disabled or self.stages is None or not self.stages.is_file() or self.stage_unprofitable >= 2
+                or self.used_cpu >= self.cpu_budget or time.monotonic() >= self.deadline):
+            return selected, []
+        candidates = {n for n in selected - set(protected)
+                      if self.tests[n]['id'].startswith('tests/test_executor.py::TestExecutor::')
+                      and self.tests[n]['id'].rsplit('::', 1)[1] in METHODS}
+        if not candidates or self.cost(selected) - self.cost(selected - candidates) < 2:
+            return selected, []
+        try:
+            if self.stage_baseline is None:
+                self.stage_baseline = load_profile(self.stages)
+            plans = plan(self.stage_baseline, self.base, patch, [self.tests[n]['id'].rsplit('::', 1)[1] for n in candidates])
+            requested = []
+            tested = set()
+            for n in sorted(candidates, key=lambda n: -self.tests[n]['seconds']):
+                row = plans.get(self.tests[n]['id'].rsplit('::', 1)[1])
+                if row is None:
+                    continue
+                indices, estimate = row
+                saving = self.cost(selected) - self.cost(selected - {n})
+                if .8 + estimate * 1.4 < min(8, saving * .65, self.cpu_budget - self.used_cpu):
+                    requested.extend(indices)
+                    tested.add(n)
+            if not tested:
+                return selected, []
+            saving = self.cost(selected) - self.cost(selected - tested)
+            budget = min(10, saving * .65, self.cpu_budget - self.used_cpu)
+            self.start()
+            budget = min(budget, self.cpu_budget-self.used_cpu)
+            if budget <= 0:
+                return selected, []
+            request = dict(kind='stages', patch=patch, tests=[self.tests[n]['id'] for n in sorted(tested)],
+                           indices=sorted(set(requested)), cpu_limit=budget,
+                           wall_limit=min(20, max(.1, self.deadline-time.monotonic())))
+            self.process.stdin.write(json.dumps(request, separators=(',', ':'))+'\n')
+            self.process.stdin.flush()
+            result = self.read(min(22, max(.1, self.deadline-time.monotonic())))
+            self.used_cpu += result['cpu']
+            passed = {self.by_id[name] for name in result.get('passed', []) if name in self.by_id} & tested
+            if result.get('replayed_stages') != len(request['indices']):
+                passed = set()
+            net = self.cost(selected) - self.cost(selected-passed) - result['cpu']
+            self.stage_unprofitable = self.stage_unprofitable + 1 if net <= 0 else 0
+            return selected-passed, [f'verified {len(passed)} executor tests through {len(request["indices"])} affected stages']
+        except (OSError, ValueError, KeyError, TypeError, SyntaxError, RecursionError, TimeoutError, EOFError):
+            self.close()
+            self.stage_unprofitable += 1
+            return selected, ['stage replay unavailable; retained executor candidates']
 
     def task_query_refine(self, patch, selected, *, protected=(), planning_patch=None):
         from queryreplay import TEST, load_profile, plan
@@ -671,7 +852,14 @@ class Verifier:
             return selected, []
         budget = min(self.cpu_budget - self.used_cpu, 12.0 if progressive else 8.0, max(3.5, estimate * 1.5))
         try:
-            self.start()
+            use_warm = False
+            if self.warm and not fixture_plans and not (set(candidates) & getattr(self, 'protected', set())):
+                from warmcheck import plan
+                use_warm = plan(self.base, patch, self.compiled, self.warm) is not None
+            if use_warm:
+                self.start(warm=True)
+            else:
+                self.start()
             budget = min(budget, self.cpu_budget - self.used_cpu)
             if budget <= 0:
                 return selected, []
@@ -690,6 +878,16 @@ class Verifier:
             self.process.stdin.flush()
             result = self.read(min(22 if progressive else 20, max(0.1, self.deadline - time.monotonic())))
             self.used_cpu += result["cpu"]
+            if use_warm and not result.get('passed') and self.used_cpu < self.cpu_budget:
+                # Warm eligibility or a live alias can fail independently of
+                # the test. Retry once against freshly imported patched files.
+                self.start()
+                request['cpu_limit'] = min(budget, self.cpu_budget-self.used_cpu)
+                self.process.stdin.write(json.dumps(request, separators=(',', ':'))+'\n')
+                self.process.stdin.flush()
+                cold = self.read(min(22, max(.1, self.deadline-time.monotonic())))
+                self.used_cpu += cold['cpu']
+                result = dict(cold, cpu=result['cpu']+cold['cpu'])
             if self.timing and not request['fixture_plans']:
                 # Whole-suite method timings exclude checkout, collection and
                 # cold imports. Price further exploration with their observed
@@ -721,6 +919,9 @@ if __name__ == "__main__":
     parser.add_argument("--task-queries", type=Path)
     parser.add_argument("--fixtures", type=Path)
     parser.add_argument('--passes', type=Path)
+    parser.add_argument('--stages', type=Path)
+    parser.add_argument('--warm', action='store_true')
+    parser.add_argument('--imported', type=Path)
     args = parser.parse_args()
     if args.serve:
-        serve(args.source, args.queries, args.task_queries, args.fixtures, args.passes)
+        serve(args.source, args.queries, args.task_queries, args.fixtures, args.passes, args.stages, args.warm, args.imported)

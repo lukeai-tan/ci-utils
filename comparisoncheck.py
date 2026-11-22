@@ -139,7 +139,7 @@ def load_comparison_profile(path):
     try:
         with gzip.open(path, "rt") as stream:
             profile = json.load(stream)
-        if (profile["revision"] != REVISION or profile["version"] not in (1, 2, 3, 4)
+        if (profile["revision"] != REVISION or profile["version"] not in (1, 2, 3, 4, 5)
                 or profile["kind"] != "comparison_types" or not profile["collection_complete"]
                 or "startup" in profile.get("bad", [])
                 or not isinstance(profile["sources"], dict)
@@ -149,7 +149,17 @@ def load_comparison_profile(path):
         if (not complete <= set(range(len(profile["tests"])))
                 or not all(profile["tests"][i] in profile["cpu"] for i in complete)):
             return None
-        if profile['version'] == 4:
+        if profile['version'] in (4, 5):
+            if profile['version'] == 5:
+                from relationcheck import OPS
+                for key, rows in profile['relations'].items():
+                    if not isinstance(key, str) or not isinstance(rows, dict):
+                        return None
+                    for context, codes in rows.items():
+                        if ((context != 'startup' and int(context) not in range(len(profile['tests'])))
+                                or not isinstance(codes, list) or not codes
+                                or any(type(code) is not int or not 0 <= code < 1 << (2 * len(OPS)) for code in codes)):
+                            return None
             limit = sum(1 << i for i in complete)
             if (not isinstance(profile['certified'], dict)
                     or any(type(key) is not str or type(bits) is not str
@@ -196,6 +206,11 @@ def certified_tests(profile, updates, originals, catalog, *, trees=None):
     """Every edited comparison must have safe evidence in each removed context."""
     if not profile:
         return set()
+    if profile['version'] == 5:
+        from relationcheck import certified
+        related = certified(profile, updates, originals, catalog, trees=trees)
+    else:
+        related = set()
     changes = set()
     for path, updated in updates.items():
         if profile["sources"].get(path) != source_hash(originals[path]):
@@ -203,7 +218,7 @@ def certified_tests(profile, updates, originals, catalog, *, trees=None):
         old, new = trees[path] if trees is not None else (ast.parse(originals[path]), ast.parse(updated))
         found = comparison_changes(old, new, path)
         if not found:
-            return set()
+            return related
         # Identity comparisons with folded literals can change import warnings
         # even when the comparison itself has the same result.
         with warnings.catch_warnings(record=True) as observed:
@@ -217,11 +232,11 @@ def certified_tests(profile, updates, originals, catalog, *, trees=None):
         return set()
     safe_contexts = set(profile["complete"])
     for key in changes:
-        if profile["version"] in (3, 4):
+        if profile["version"] in (3, 4, 5):
             contexts = profile["certified"].get(key)
             if not contexts:
                 return set()
-            if profile['version'] == 4:
+            if profile['version'] in (4, 5):
                 mask = int(contexts, 16)
                 contexts = [i for i in safe_contexts if mask & (1 << i)]
             safe_contexts.intersection_update(contexts)
@@ -236,4 +251,4 @@ def certified_tests(profile, updates, originals, catalog, *, trees=None):
                                          if context != "startup" and pairs
                                          and all(identity_equality_pair(pair) for pair in pairs))
     ids = {profile["tests"][i] for i in safe_contexts}
-    return {test["number"] for test in catalog if test["id"] in ids}
+    return related | {test["number"] for test in catalog if test["id"] in ids}

@@ -8,6 +8,7 @@ import concurrent.futures
 import gzip
 import hashlib
 import json
+import lzma
 import os
 import pickle
 import subprocess
@@ -437,7 +438,10 @@ def run_boundaries(root, *, recording=None, baseline=None, methods=METHODS, chan
 def load_baseline(path):
     try:
         with gzip.open(path, "rb") as source:
-            baseline = pickle.load(source)
+            raw = source.read()
+        if raw.startswith(b'\xfd7zXZ\x00'):
+            raw = lzma.decompress(raw)
+        baseline = pickle.loads(raw)
     except (pickle.UnpicklingError, EOFError) as error:
         raise ValueError("invalid query baseline") from error
     if baseline["revision"] != REVISION or baseline["version"] != 3:
