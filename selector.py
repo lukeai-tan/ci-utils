@@ -806,6 +806,7 @@ def main():
     parser.add_argument('--no-warm-verification', action='store_true')
     parser.add_argument('--warm-verification', action='store_true')
     parser.add_argument('--aggressive', action='store_true')
+    parser.add_argument('--aggressive-min-cpu', type=float, choices=(1.0, 2.0, 4.0), default=4.0)
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -855,6 +856,7 @@ def main():
                                                fixture_delta=not args.no_fixture_delta,
                                                progressive=not args.no_progressive_verification,
                                                aggressive=args.aggressive,
+                                               aggressive_min_cpu=args.aggressive_min_cpu,
                                                compiled=compiled)
     try:
         for path in sorted((args.data / "commits").glob("*.patch")):

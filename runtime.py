@@ -355,7 +355,7 @@ def serve(base, queries=None, task_queries=None, fixtures=None, passes=None, sta
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, passes=None, stages=None, imported=None, dispatch=None, warm=None, fixture_delta=True, progressive=True, aggressive=False, aggressive_min_cpu=4.0, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -378,6 +378,7 @@ class Verifier:
         self.progressive_overhead = 1.5
         self.progressive = progressive
         self.aggressive = aggressive
+        self.aggressive_min_cpu = aggressive_min_cpu
         self.aggressive_cpu = 0.0
         self.aggressive_attempted = set()
         self.fixture_delta = fixture_delta
@@ -774,7 +775,8 @@ class Verifier:
             return selected, []
         eligible = selected - set(protected)
         prices = self.timing['cpu']
-        expensive = {n for n in eligible if prices.get(self.tests[n]['id'], 0) >= 4.0}
+        expensive = {n for n in eligible
+                     if prices.get(self.tests[n]['id'], 0) >= self.aggressive_min_cpu}
         if not expensive:
             return selected, []
         saving = self.cost(selected) - self.cost(selected - expensive)

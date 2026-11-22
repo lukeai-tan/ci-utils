@@ -20,4 +20,4 @@ RUN python -c 'import gzip,lzma; from pathlib import Path; p=Path("/app/maps/que
 COPY LICENSE tools/SQLGLOT_LICENSE /app/licenses/
 WORKDIR /app
 USER 65534:65534
-CMD ["python", "/app/selector.py", "--aggressive"]
+CMD ["python", "/app/selector.py", "--aggressive", "--aggressive-min-cpu", "1.0"]
