@@ -15,6 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
+from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -128,9 +129,21 @@ def apply_edit(source, edit):
 
 
 FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_ast_comparisons = ContextVar('ast_comparisons', default=None)
 
 
 def same_ast(old, new, *, structure=False, settings=False):
+    """Reuse comparisons only within a selection's immutable parsed trees."""
+    cache = _ast_comparisons.get()
+    if cache is None or not isinstance(old, ast.AST) or not isinstance(new, ast.AST):
+        return _same_ast(old, new, structure=structure, settings=settings)
+    key = old, new, structure, settings
+    if key not in cache:
+        cache[key] = _same_ast(old, new, structure=structure, settings=settings)
+    return cache[key]
+
+
+def _same_ast(old, new, *, structure=False, settings=False):
     """Compare syntax without allocating dumps or modifying cached trees."""
     pending = [(old, new)]
     while pending:
@@ -458,6 +471,15 @@ class Selector:
         return initialization, impacted
 
     def select(self, patch, *, use_cold=True, _prepared=None):
+        if _ast_comparisons.get() is not None:
+            return self._select(patch, use_cold=use_cold, _prepared=_prepared)
+        token = _ast_comparisons.set({})
+        try:
+            return self._select(patch, use_cold=use_cold, _prepared=_prepared)
+        finally:
+            _ast_comparisons.reset(token)
+
+    def _select(self, patch, *, use_cold=True, _prepared=None):
         selected = set(self.unknown)
         reasons = []
         try:
