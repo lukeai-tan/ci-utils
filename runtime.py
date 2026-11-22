@@ -782,20 +782,13 @@ class Verifier:
                      if prices.get(self.tests[n]['id'], 0) >= self.aggressive_min_cpu}
         if not expensive:
             return self.small_group_refine(patch, selected, protected=protected)
-        omittable = ({n for n in eligible if self.tests[n]['id'] in prices}
-                     if self.aggressive_broad else expensive)
-        saving = self.cost(selected) - self.cost(selected - omittable)
+        saving = self.cost(selected) - self.cost(selected - expensive)
         cheap = sorted((n for n in eligible - expensive
                         if self.tests[n]['id'] in prices and prices[self.tests[n]['id']] <= .35),
                        key=lambda n: (prices[self.tests[n]['id']], n))
-        if not cheap or saving < (3 if self.aggressive_broad else 4):
+        if not cheap or saving < 4:
             return self.small_group_refine(patch, selected, protected=protected)
-        if self.aggressive_broad and saving < 6:
-            worker = self.process if self.process is not None and not self.warm_mode else self.processes.get(False)
-            if worker is None or worker.poll() is not None:
-                return self.small_group_refine(patch, selected, protected=protected)
-        spend = .8 if self.aggressive_broad else .35
-        budget = min(2.5, saving * spend, self.cpu_budget - self.used_cpu, 20 - self.aggressive_cpu)
+        budget = min(2.5, saving * .35, self.cpu_budget - self.used_cpu, 20 - self.aggressive_cpu)
         if budget < 1.5:
             return self.small_group_refine(patch, selected, protected=protected)
         # Include class setup/teardown when choosing up to eight cheap probes.
@@ -837,7 +830,8 @@ class Verifier:
             if clean:
                 # Broad omission reuses the same probe and activation gates.
                 # Protected tests and absent timing evidence remain selected.
-                omitted = omittable - passed
+                omitted = ({n for n in eligible - passed if self.tests[n]['id'] in prices}
+                           if self.aggressive_broad else expensive)
                 kind = 'profiled' if self.aggressive_broad else 'expensive'
                 return selected - passed - omitted, [
                     f'aggressive: {len(passed)} clean probes; speculatively omitted {len(omitted)} unrun {kind} tests']
