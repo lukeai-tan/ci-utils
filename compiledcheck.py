@@ -146,7 +146,7 @@ def query_plan(profile, base, patch, tasks):
     return sorted(indices), estimate, eligible
 
 
-def consumers(profile, path, original, updated):
+def consumers(profile, path, original, updated, *, trees=None, statements=True):
     """Return a baseline-index mask; unsupported or startup changes stay broad."""
     if not profile or profile.get('python') != list(sys.version_info[:2]):
         return None
@@ -155,6 +155,10 @@ def consumers(profile, path, original, updated):
         return None
     try:
         pairs = list(changes(compile(original, path, 'exec', dont_inherit=True), compile(updated, path, 'exec', dont_inherit=True)))
+        if trees is None:
+            import ast
+            trees = ast.parse(original), ast.parse(updated)
+        from statementcheck import locations as statement_locations
         entries = profile['codes'].get(path, {})
         selected = 0
         for before, after in pairs:
@@ -167,6 +171,12 @@ def consumers(profile, path, original, updated):
             if row is None or row['startup']:
                 return None
             locations = constant_locations(before, after) if before.co_flags & 1 else None
+            if locations is None and statements:
+                spans = statement_locations(*trees, before, after)
+                if spans and all(any(str(n) in row['lines'] for n in range(start, end + 1))
+                                 for start, end in spans):
+                    locations = {n for start, end in spans for n in range(start, end + 1)
+                                 if str(n) in row['lines']}
             # Captured values are consumed after the outer call. Frame entry is
             # the fallback whenever a changed function creates closure cells.
             if locations and not before.co_cellvars and all(str(n) in row['lines'] for n in locations):

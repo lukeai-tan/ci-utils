@@ -522,7 +522,8 @@ class Selector:
                 compiled_profile = self.mapping.get('compiled_consumers') if use_cold else None
                 if evidence is None and compiled_profile:
                     from compiledcheck import consumers
-                    mask = consumers(compiled_profile, path, source, updated)
+                    mask = consumers(compiled_profile, path, source, updated, trees=(old_tree, new_tree),
+                                     statements=self.mapping.get("statement_selection", True))
                     if mask is not None:
                         evidence = compiled_profile, mask, 'cold executable scopes'
                 if evidence is not None:
@@ -764,6 +765,7 @@ def main():
     parser.add_argument("--timing", type=Path, default=Path(__file__).parent / "maps/timing.json.gz")
     parser.add_argument('--compiled', type=Path, default=Path(__file__).parent / 'maps/compiled.json.gz')
     parser.add_argument('--fields', type=Path, default=Path(__file__).parent / 'maps/fields.json.gz')
+    parser.add_argument("--no-statement-selection", action="store_true")
     args = parser.parse_args()
     start = time.process_time()
     children_start = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -774,6 +776,7 @@ def main():
     with gzip.open(args.map, "rt") as f:
         mapping = json.load(f)
     merge_profile(mapping, profile, load_setting_flow(args.setting_flow))
+    mapping["statement_selection"] = not args.no_statement_selection
     from compiledcheck import load_profile as load_compiled
     from fieldcheck import load_profile as load_fields
     compiled = load_compiled(args.compiled)

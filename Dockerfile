@@ -12,7 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
 COPY requirements.lock /app/requirements.lock
 RUN python -m pip install --no-cache-dir -r /app/requirements.lock
 COPY --from=baseline /source /app/source
-COPY selector.py runtime.py querycheck.py comparisoncheck.py valuecheck.py queryreplay.py behaviorcheck.py compiledcheck.py fieldcheck.py /app/
+COPY selector.py runtime.py querycheck.py comparisoncheck.py valuecheck.py queryreplay.py behaviorcheck.py compiledcheck.py fieldcheck.py statementcheck.py /app/
 COPY maps/baseline.json.gz maps/runtime.json.gz maps/settings.json.gz maps/comparisons.json.gz maps/values.json.gz maps/query-values.pkl.gz maps/queries.pkl.gz maps/behavior.json.gz maps/timing.json.gz maps/compiled.json.gz maps/fields.json.gz /app/maps/
 COPY LICENSE tools/SQLGLOT_LICENSE /app/licenses/
 WORKDIR /app

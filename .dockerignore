@@ -24,3 +24,5 @@
 !LICENSE
 !tools/
 !tools/SQLGLOT_LICENSE
+
+!statementcheck.py
