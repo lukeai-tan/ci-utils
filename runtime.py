@@ -168,7 +168,7 @@ class Verdicts:
                       if phases == {"setup", "call", "teardown"} and name not in self.bad)
 
 
-def run_tests(root, names, cpu_limit):
+def run_tests(root, names, cpu_limit, *, fixtures=None, fixture_plans=None):
     import pytest
 
     os.chdir(root)
@@ -177,6 +177,13 @@ def run_tests(root, names, cpu_limit):
                       PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
                       OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", NUMEXPR_MAX_THREADS="1")
     verdicts = Verdicts()
+    plugins = [verdicts]
+    case_filter = None
+    if fixtures is not None and fixture_plans:
+        from fixturecheck import Filter
+        case_filter = Filter(fixtures, fixture_plans)
+        case_filter.install()
+        plugins.append(case_filter)
 
     def timed_out(signum, frame):
         raise TimeoutError("verification CPU budget")
@@ -186,10 +193,10 @@ def run_tests(root, names, cpu_limit):
     try:
         pytest.main([*names, "-q", "--maxfail=1", "--import-mode=importlib", "--rootdir=" + str(root),
                      "-p", "no:cacheprovider", "-p", "pytest_timeout",
-                     "--timeout=5"], plugins=[verdicts])
+                     "--timeout=5"], plugins=plugins)
     finally:
         signal.setitimer(signal.ITIMER_PROF, 0)
-    return {"passed": verdicts.passed()}
+    return {"passed": [name for name in verdicts.passed() if case_filter is None or case_filter.complete(name)]}
 
 
 def cpu_seconds():
@@ -198,7 +205,7 @@ def cpu_seconds():
     return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
 
 
-def serve(base, queries=None, task_queries=None):
+def serve(base, queries=None, task_queries=None, fixtures=None):
     os.environ.update(PYTHONDONTWRITEBYTECODE="1", OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1",
                       NUMEXPR_MAX_THREADS="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     import pytest  # Warm third-party imports only; patched packages load in children.
@@ -211,12 +218,16 @@ def serve(base, queries=None, task_queries=None):
     if task_queries is not None and task_queries.is_file():
         from queryreplay import load_profile
         task_baseline = load_profile(task_queries)
+    fixture_baseline = None
 
     print(json.dumps({"ready": True, "cpu": cpu_seconds()}), flush=True)
     for line in sys.stdin:
         started = cpu_seconds()
         try:
             request = json.loads(line)
+            if fixtures is not None and request.get('fixture_plans') and fixture_baseline is None:
+                from fixturecheck import load_profile
+                fixture_baseline = load_profile(fixtures)
             if any("test_executor.py" in name or "test_optimizer.py" in name for name in request.get("tests", [])):
                 import duckdb
                 import numpy
@@ -243,7 +254,8 @@ def serve(base, queries=None, task_queries=None):
                                                     methods=[name.rsplit("::", 1)[-1] for name in request["tests"]],
                                                     changed_files=[edit.path for edit in tree.edits])
                         else:
-                            result = run_tests(tree.root, request["tests"], request["cpu_limit"])
+                            result = run_tests(tree.root, request["tests"], request["cpu_limit"],
+                                               fixtures=fixture_baseline, fixture_plans=request.get('fixture_plans'))
                         payload = json.dumps(result).encode()
                         with os.fdopen(write_fd, "wb") as output:
                             output.write(payload)
@@ -281,7 +293,7 @@ def serve(base, queries=None, task_queries=None):
 
 
 class Verifier:
-    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, cpu_budget=45, wall_budget=135):
+    def __init__(self, base, profile, tests, schedule, *, queries=None, values=None, behavior=None, timing=None, task_queries=None, compiled=None, fixtures=None, cpu_budget=45, wall_budget=135):
         self.base = Path(base)
         self.profile = profile or {}
         self.timing = timing
@@ -295,6 +307,7 @@ class Verifier:
         self.disabled = not self.base.is_dir()
         self.unprofitable = 0
         self.task_unprofitable = 0
+        self.fixture_unprofitable = 0
         self.queries = Path(queries) if queries is not None else None
         self.query_backend_files = None
         self.values = values
@@ -302,6 +315,9 @@ class Verifier:
         self.behavior = behavior
         self.task_queries = Path(task_queries) if task_queries is not None else None
         self.task_baseline = None
+        self.fixtures = Path(fixtures) if fixtures is not None else None
+        self.fixture_baseline = None
+        self.fixture_available = self.fixtures is not None and self.fixtures.is_file()
         self.task_available = bool((values or behavior) and self.task_queries is not None and self.task_queries.is_file())
         if self.queries is not None and self.queries.is_file():
             from querycheck import load_baseline
@@ -344,6 +360,8 @@ class Verifier:
                 command.extend(["--queries", str(self.queries.resolve())])
             if self.task_baseline is not None:
                 command.extend(["--task-queries", str(self.task_queries.resolve())])
+            if self.fixture_available:
+                command.extend(["--fixtures", str(self.fixtures.resolve())])
             self.process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -465,6 +483,20 @@ class Verifier:
                 or time.monotonic() >= self.deadline or self.used_cpu >= self.cpu_budget):
             return selected, []
         prices = self.timing["cpu"] if self.timing else self.profile.get("cpu", {})
+        fixture_plans = {}
+        if (self.fixture_available and self.fixture_unprofitable < 2 and 'sqlglot/optimizer/' in patch
+                and any(self.tests[n]['id'].startswith('tests/test_optimizer.py::TestOptimizer::') for n in selected)):
+            from fixturecheck import load_profile, plan
+            try:
+                if self.fixture_baseline is None:
+                    self.fixture_baseline = load_profile(self.fixtures)
+                fixture_plans = plan(self.fixture_baseline, self.base, patch,
+                                     [self.tests[n]['id'] for n in selected])
+            except (OSError, ValueError, KeyError, TypeError, SyntaxError, RecursionError):
+                fixture_plans = {}
+        if fixture_plans:
+            prices = dict(prices)
+            prices.update({name: row['cpu'] for name, row in fixture_plans.items()})
         # Simulated duration does not predict verification CPU. Use measured
         # real method and fixture costs, and retain anything not completed.
         candidates = {n for n in selected if self.tests[n]["id"] in prices
@@ -499,6 +531,8 @@ class Verifier:
         try:
             self.start()
             request = {"patch": patch, "tests": [self.tests[n]["id"] for n in sorted(candidates)],
+                       "fixture_plans": {self.tests[n]['id']: fixture_plans[self.tests[n]['id']]
+                                         for n in candidates if self.tests[n]['id'] in fixture_plans},
                        "cpu_limit": budget, "wall_limit": min(15, max(2, self.deadline - time.monotonic()))}
             self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
@@ -506,8 +540,13 @@ class Verifier:
             self.used_cpu += result["cpu"]
             passed = {self.by_id[name] for name in result["passed"] if name in self.by_id} & candidates
             net = self.cost(selected) - self.cost(selected - passed) - result["cpu"]
-            self.unprofitable = self.unprofitable + 1 if net <= 0 else 0
-            return selected - passed, [f"verified {len(passed)} passing candidates"]
+            if request['fixture_plans']:
+                self.fixture_unprofitable = self.fixture_unprofitable + 1 if net <= 0 else 0
+            else:
+                self.unprofitable = self.unprofitable + 1 if net <= 0 else 0
+            trimmed = sum(self.tests[n]['id'] in request['fixture_plans'] for n in passed)
+            note = f" ({trimmed} with affected fixture cases)" if trimmed else ''
+            return selected - passed, [f"verified {len(passed)} passing candidates" + note]
         except (OSError, ValueError, KeyError, TypeError, EOFError, TimeoutError):
             self.close()
             self.disabled = True
@@ -520,6 +559,7 @@ if __name__ == "__main__":
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--queries", type=Path)
     parser.add_argument("--task-queries", type=Path)
+    parser.add_argument("--fixtures", type=Path)
     args = parser.parse_args()
     if args.serve:
-        serve(args.source, args.queries, args.task_queries)
+        serve(args.source, args.queries, args.task_queries, args.fixtures)

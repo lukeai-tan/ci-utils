@@ -29,6 +29,7 @@ output*.jsonl
 !/tools/compact_query_states.py
 !/tools/build_checkpoints.py
 !/tools/merge_compiled_profiles.py
+!/tools/build_fixture_profile.py
 
 # Private research must never be included by normal staging.
 **/public-research*
